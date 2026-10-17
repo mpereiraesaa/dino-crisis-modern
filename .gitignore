@@ -1,0 +1,8 @@
+build/
+dist/
+# local development notes and test tooling
+evidence/
+README.txt
+install.py
+live_probe.cpp
+virtual_pad.py

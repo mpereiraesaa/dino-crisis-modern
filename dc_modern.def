@@ -1,0 +1,3 @@
+LIBRARY dc_modern
+EXPORTS
+    XInputGetState=DcGetState@8
