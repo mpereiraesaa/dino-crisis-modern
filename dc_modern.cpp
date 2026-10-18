@@ -526,10 +526,123 @@ static void hookHitTest() {
     applyPatch(entry,jump,6);
 }
 
+// The mod's menu (L3+R3): quick save, quick load, all weapons, infinite
+// ammo. It is drawn on the back buffer at Present, like the crosshair; while
+// it is open the game gets no input, and buttons held when it closes stay
+// withheld until let go.
+enum MenuItem { ITEM_SAVE, ITEM_LOAD, ITEM_WEAPONS, ITEM_AMMO, ITEM_CLOSE, ITEM_COUNT };
+static volatile bool menuOpen;
+static volatile int menuCursor;
+static volatile bool infiniteAmmo;
+static volatile int menuNotice;          // frames left showing "DONE"
+static WORD menuWithheld;
+
+// Infinite ammo: the four weapons' `mov [reg+...],cx/dx/ax` that store the
+// decremented count (from the SourceNext cheat table), as NOPs.
+struct AmmoSite { uintptr_t at; uint8_t original[7]; };
+static const AmmoSite ammoSites[]={
+    {0x486c37,{0x66,0x89,0x8a,0x88,0x00,0x00,0x00}},
+    {0x48b91f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
+    {0x49041f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
+    {0x495001,{0x66,0x89,0x81,0x84,0x00,0x00,0x00}},
+};
+static void setInfiniteAmmo(bool on) {
+    static const uint8_t nops[7]={0x90,0x90,0x90,0x90,0x90,0x90,0x90};
+    for(const AmmoSite& a : ammoSites)
+        if(!memcmp(reinterpret_cast<void*>(a.at),on?a.original:nops,7))
+            applyPatch(reinterpret_cast<void*>(a.at),on?nops:a.original,7);
+    infiniteAmmo=on;
+    WritePrivateProfileStringA("Cheats","InfiniteAmmo",on?"1":"0",ini);
+}
+
+// Quick load: the game has no way back to its title from play, but its
+// game-over screen (outer state 4) leaves for the title in substate 5. The
+// mod sends the game there and, once the title is up (front end 0x675BA8:
+// state 1, title 0, substate 1, the press-start screen), writes what the title menu
+// writes when Load Game (its first line) is confirmed: action 1, substate 3.
+// The game then opens its own load screen, and the player picks the save.
+enum LoadStep { LOAD_IDLE, LOAD_LEAVE, LOAD_TITLE };
+static volatile int loadStep=LOAD_IDLE;
+static DWORD loadTime;
+constexpr uintptr_t TITLE_CURSOR=0x644a08, FRONT_END=0x675ba8, TITLE_LOADED=0x675c68;
+
+static void quickLoadStep(uintptr_t g) {
+    switch(loadStep) {
+    case LOAD_LEAVE:
+        if(g) {
+            *reinterpret_cast<volatile uint16_t*>(g+0x2a)=5;
+            *reinterpret_cast<volatile uint16_t*>(g+0x28)=4;
+        }
+        loadStep=LOAD_TITLE; loadTime=GetTickCount();
+        break;
+    case LOAD_TITLE: {
+        auto fe=reinterpret_cast<volatile uint8_t*>(FRONT_END);
+        if(fe[0]==1 && fe[1]==0 && fe[2]==1 && g) {
+            *reinterpret_cast<volatile uint16_t*>(g+0x2a)=0;   // the load screen's own steps
+            *reinterpret_cast<volatile uint16_t*>(g+0x2c)=0;
+            *reinterpret_cast<volatile int32_t*>(TITLE_CURSOR)=0;
+            *reinterpret_cast<volatile uint32_t*>(TITLE_LOADED)=0;
+            *reinterpret_cast<volatile uint16_t*>(FRONT_END+8)=900;
+            fe[3]=1; fe[2]=3;
+            loadStep=LOAD_IDLE;
+        } else if(GetTickCount()-loadTime>30000) loadStep=LOAD_IDLE;
+        break;
+    }
+    }
+}
+
+// Returns true when the menu (or quick load) owns the pad this poll.
+static bool menuInput(uintptr_t g, XINPUT_GAMEPAD& pad) {
+    static WORD prev;
+    WORD b=pad.wButtons, pressed=b&~prev;
+    prev=b;
+    if(loadStep!=LOAD_IDLE) {
+        quickLoadStep(g);
+        memset(&pad,0,sizeof(pad));
+        return true;
+    }
+    const WORD combo=XINPUT_GAMEPAD_LEFT_THUMB|XINPUT_GAMEPAD_RIGHT_THUMB;
+    bool inPlay=g && *reinterpret_cast<volatile uint16_t*>(g+0x28)==3;
+    if(!menuOpen) {
+        if(inPlay && (b&combo)==combo && (pressed&combo)) { menuOpen=true; menuCursor=0; }
+        else if(menuWithheld) {
+            menuWithheld&=b;
+            pad.wButtons&=~menuWithheld;
+            return false;
+        } else return false;
+    }
+    if(!inPlay) menuOpen=false;
+    if(pressed&XINPUT_GAMEPAD_DPAD_UP) menuCursor=(menuCursor+ITEM_COUNT-1)%ITEM_COUNT;
+    if(pressed&XINPUT_GAMEPAD_DPAD_DOWN) menuCursor=(menuCursor+1)%ITEM_COUNT;
+    if(pressed&XINPUT_GAMEPAD_B) menuOpen=false;
+    if(pressed&XINPUT_GAMEPAD_A) {
+        switch(menuCursor) {
+        case ITEM_SAVE:
+            *reinterpret_cast<volatile uint16_t*>(g+0x28)=7;   // the save screen, anywhere
+            menuOpen=false; break;
+        case ITEM_LOAD:
+            loadStep=LOAD_LEAVE; menuOpen=false; break;
+        case ITEM_WEAPONS:
+            // The owned-gear bits (0x6DD9D8): the weapons are added, and
+            // whatever else is owned (parts) is kept.
+            *reinterpret_cast<volatile uint16_t*>(0x6dd9d8)|=0x07fe;
+            menuNotice=45; break;
+        case ITEM_AMMO:
+            setInfiniteAmmo(!infiniteAmmo); break;
+        case ITEM_CLOSE:
+            menuOpen=false; break;
+        }
+    }
+    if(!menuOpen) menuWithheld=b;
+    memset(&pad,0,sizeof(pad));
+    return true;
+}
+
 static void hookDispatch();
 static void hookCameraCallbacks() {
     if(callbacksHooked || !supported) return;
     callbacksHooked=true;
+    if(GetPrivateProfileIntA("Cheats","InfiniteAmmo",0,ini)) setInfiniteAmmo(true);
     hookHitTest();
     hookDispatch();
     auto table=reinterpret_cast<CameraCallback*>(CAM_CALLBACKS);
@@ -575,8 +688,15 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
     if(onPs5<0) onPs5=titleMenuPresent();
     WORD pressed=pad.wButtons&~camPrevButtons;
     camPrevButtons=pad.wButtons;
-    WORD toggles=onPs5?XINPUT_GAMEPAD_GUIDE:XINPUT_GAMEPAD_RIGHT_THUMB;
-    if((pressed&toggles) || toggleKeyPressed()) {
+    // R3 toggles when it is let go, unless L3 was pressed meanwhile: L3+R3
+    // opens the mod's menu.
+    static bool r3Held, r3Spoiled;
+    bool r3=(pad.wButtons&XINPUT_GAMEPAD_RIGHT_THUMB)!=0, r3Toggle=false;
+    if(r3 && !r3Held) r3Spoiled=false;
+    if(r3 && (pad.wButtons&XINPUT_GAMEPAD_LEFT_THUMB)) r3Spoiled=true;
+    if(!r3 && r3Held && !r3Spoiled && !onPs5) r3Toggle=true;
+    r3Held=r3;
+    if((pressed&XINPUT_GAMEPAD_GUIDE && onPs5) || r3Toggle || toggleKeyPressed()) {
         camOn=!camOn;
         WritePrivateProfileStringA("Camera","Mode",camOn?"Modern":"Fixed",ini);
         cameraMode=camOn;
@@ -754,9 +874,93 @@ static void drawCrosshair(IDirect3DDevice9* device) {
     back->Release();
 }
 
+// A 5x7 pixel font for the menu: rows top to bottom, 5 bits each, leftmost
+// pixel in bit 4.
+static const uint8_t* glyph(char c) {
+    static const struct { char c; uint8_t rows[7]; } font[]={
+        {'A',{14,17,17,31,17,17,17}},{'B',{30,17,17,30,17,17,30}},{'C',{14,17,16,16,16,17,14}},
+        {'D',{30,17,17,17,17,17,30}},{'E',{31,16,16,30,16,16,31}},{'F',{31,16,16,30,16,16,16}},
+        {'G',{14,17,16,23,17,17,15}},{'H',{17,17,17,31,17,17,17}},{'I',{14,4,4,4,4,4,14}},
+        {'J',{7,2,2,2,2,18,12}},{'K',{17,18,20,24,20,18,17}},{'L',{16,16,16,16,16,16,31}},
+        {'M',{17,27,21,21,17,17,17}},{'N',{17,17,25,21,19,17,17}},{'O',{14,17,17,17,17,17,14}},
+        {'P',{30,17,17,30,16,16,16}},{'Q',{14,17,17,17,21,18,13}},{'R',{30,17,17,30,20,18,17}},
+        {'S',{15,16,16,14,1,1,30}},{'T',{31,4,4,4,4,4,4}},{'U',{17,17,17,17,17,17,14}},
+        {'V',{17,17,17,17,17,10,4}},{'W',{17,17,17,21,21,21,10}},{'X',{17,17,10,4,10,17,17}},
+        {'Y',{17,17,10,4,4,4,4}},{'Z',{31,1,2,4,8,16,31}},{':',{0,12,12,0,12,12,0}},
+        {'>',{8,4,2,1,2,4,8}},{'-',{0,0,0,31,0,0,0}},{'.',{0,0,0,0,0,12,12}},
+    };
+    for(const auto& f : font) if(f.c==c) return f.rows;
+    return nullptr;
+}
+
+static void drawMenu(IDirect3DDevice9* device) {
+    static const char* labels[ITEM_COUNT]={"QUICK SAVE","QUICK LOAD","ALL WEAPONS",nullptr,"CLOSE"};
+    IDirect3DSurface9 *target=nullptr, *back=nullptr;
+    if(FAILED(device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&back))) return;
+    D3DSURFACE_DESC desc{};
+    back->GetDesc(&desc);
+    IDirect3DStateBlock9* saved=nullptr;
+    if(!desc.Width || !desc.Height || FAILED(device->CreateStateBlock(D3DSBT_ALL,&saved))) { back->Release(); return; }
+    device->GetRenderTarget(0,&target);
+    device->SetRenderTarget(0,back);
+    device->BeginScene();
+    D3DVIEWPORT9 viewport={0,0,desc.Width,desc.Height,0,1};
+    device->SetViewport(&viewport);
+    device->SetVertexShader(nullptr); device->SetPixelShader(nullptr);
+    device->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE);
+    device->SetTexture(0,nullptr);
+    device->SetTextureStageState(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_DIFFUSE);
+    device->SetTextureStageState(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_DIFFUSE);
+    device->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE);
+    device->SetRenderState(D3DRS_ZENABLE,FALSE); device->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+    device->SetRenderState(D3DRS_STENCILENABLE,FALSE); device->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA); device->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE); device->SetRenderState(D3DRS_LIGHTING,FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE,FALSE); device->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE); device->SetRenderState(D3DRS_COLORWRITEENABLE,0xf);
+
+    float px=std::max(2.0f,std::floor(desc.Height/160.0f));   // one font pixel
+    float lineH=px*11, charW=px*6;
+    const char* title="DINO CRISIS MODERN";
+    char lines[ITEM_COUNT][32];
+    for(int i=0;i<ITEM_COUNT;i++)
+        snprintf(lines[i],sizeof(lines[i]),"%s",labels[i]?labels[i]:(infiniteAmmo?"INFINITE AMMO: ON":"INFINITE AMMO: OFF"));
+    float boxW=charW*22, boxH=lineH*(ITEM_COUNT+2.5f);
+    float x0=(desc.Width-boxW)*0.5f, y0=(desc.Height-boxH)*0.5f;
+    static CrosshairVertex verts[6*2600];
+    CrosshairVertex* v=verts;
+    addBar(v,x0,y0,x0+boxW,y0+boxH,0xc0000000);
+    auto text=[&](const char* str, float x, float y, DWORD color) {
+        for(const char* c=str;*c;c++,x+=charW) {
+            const uint8_t* rows=glyph(*c);
+            if(!rows) continue;
+            for(int r=0;r<7;r++) for(int col=0;col<5;col++)
+                if((rows[r]>>(4-col))&1 && v<verts+6*2599)
+                    addBar(v,x+col*px,y+r*px,x+(col+1)*px,y+(r+1)*px,color);
+        }
+    };
+    text(title,x0+charW*2,y0+lineH*0.6f,0xffffc040);
+    for(int i=0;i<ITEM_COUNT;i++) {
+        bool sel=i==menuCursor;
+        float y=y0+lineH*(i+2);
+        if(sel) text(">",x0+charW*2,y,0xffffffff);
+        text(lines[i],x0+charW*4,y,sel?0xffffffff:0xff9a9a9a);
+    }
+    if(menuNotice>0) { text("DONE",x0+boxW-charW*6,y0+lineH*(ITEM_WEAPONS+2),0xff60ff60); menuNotice--; }
+    device->DrawPrimitiveUP(D3DPT_TRIANGLELIST,UINT((v-verts)/3),verts,sizeof(CrosshairVertex));
+    device->EndScene();
+    saved->Apply(); saved->Release();
+    if(target) { device->SetRenderTarget(0,target); target->Release(); }
+    back->Release();
+}
+
 static HRESULT STDMETHODCALLTYPE hookPresent(IDirect3DDevice9* device, const RECT* source,
         const RECT* dest, HWND window, const RGNDATA* dirty) {
-    if(crosshairShown) drawCrosshair(device);
+    if(crosshairShown && !menuOpen) drawCrosshair(device);
+    if(menuOpen) drawMenu(device);
     return realPresent(device,source,dest,window,dirty);
 }
 static HRESULT STDMETHODCALLTYPE hookCreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type,
@@ -1125,6 +1329,12 @@ extern "C" DWORD WINAPI DcGetState(DWORD user,XINPUT_STATE* state) {
         p.running=false; p.latched=false; ReleaseSRWLockExclusive(&lock); return result;
     }
     uintptr_t gs=enabled?gameState():0;
+    if(enabled && menuInput(gs,state->Gamepad)) {
+        if(memcmp(&p.last,&state->Gamepad,sizeof(p.last))) { ++p.packet; p.last=state->Gamepad; }
+        state->dwPacketNumber=p.packet;
+        ReleaseSRWLockExclusive(&lock);
+        return result;
+    }
     if(enabled) shoulderCamera(gs,state->Gamepad);
     state->Gamepad.wButtons&=~XINPUT_GAMEPAD_GUIDE;
     if(enabled) {

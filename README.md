@@ -26,6 +26,12 @@ files and delete them to uninstall.
   frame with the camera, characters and effects halfway between them.
   Menus, the inventory and videos stay at 30. `[Display] FrameRate=30` turns
   it off.
+- **In-game menu.** Click both sticks (L3+R3) during play:
+  - **Quick save** opens the save screen anywhere, not only at the save doors.
+  - **Quick load** takes you to the game's load screen to pick a save.
+  - **All weapons** adds every weapon to your inventory.
+  - **Infinite ammo** (on/off) also means no reloads. It stays on between
+    sessions until you turn it off.
 
 The levels were only built for the fixed cameras, so the shoulder camera can
 show black void at the edge of the map.
@@ -86,6 +92,10 @@ the features a controller state alone can't do:
   vsyncs. On the second one the mod builds the scene again with the camera,
   bones and effects blended between the last two ticks, draws it into the
   idle half of the double buffer and shows it, then puts everything back.
+- **Menu.** Drawn over REbirth's frame at present. Quick save switches the
+  game to its save screen state. Quick load sends the game to its title
+  through the game-over path, then sets the title menu to "Load Game
+  confirmed", so the game opens its own load screen.
 - **Faces seen from behind.** The rooms were modelled for the fixed cameras,
   so many walls and fences only exist on one side. With the shoulder camera
   on, the mod tells Classic REbirth to keep those faces too. REbirth, not the
