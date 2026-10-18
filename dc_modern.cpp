@@ -294,6 +294,7 @@ static double camPull=1;                   // 0..1 of the wanted distance
 constexpr int AIM_HEIGHT=1250;           // the gun's height while aiming
 static volatile bool crosshairShown;
 static volatile double aimPitch;         // radians, positive up
+static volatile double lookPitch;        // the free camera's, radians, positive up
 static volatile bool freeAim;            // aiming with the shoulder camera: our hit test
 
 static void placeShoulderCamera(uintptr_t g) {
@@ -328,7 +329,7 @@ static void placeShoulderCamera(uintptr_t g) {
     // crosshair in the middle of the screen marks where she shoots.
     double side=aiming?0:shoulder*0.5;
     target[0]=clamp16(pos[0]+fx*camLook+rx*side);
-    target[1]=clamp16(pos[1]-(aiming?AIM_HEIGHT+std::tan(aimPitch)*camLook:camLookHeight));
+    target[1]=clamp16(pos[1]-(aiming?AIM_HEIGHT+std::tan(aimPitch)*camLook:camLookHeight+std::tan(lookPitch)*camLook));
     target[2]=clamp16(pos[2]+fz*camLook+rz*side);
     *reinterpret_cast<volatile int16_t*>(g+CAM_DISTANCE)=pointDistance(target,eye);
     computeViewAngles(target,eye,reinterpret_cast<volatile int16_t*>(g+CAM_ANGLES));
@@ -721,7 +722,7 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
 
     int yaw=camYaw;
     auto yawNow=*reinterpret_cast<volatile uint16_t*>(g+ACTOR+0x2a)&0xfff;
-    if(!camHeld) yaw=yawNow;               // start behind her
+    if(!camHeld) { yaw=yawNow; lookPitch=0; }   // start behind her, level
     if(aiming) {
         // Free aim, as in RE4: the right stick moves the aim, left and right
         // and up and down, and she turns to face it (cameraCallbackHook). The
@@ -731,8 +732,10 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
         if(std::abs(pad.sThumbRY)>deadzone)
             aimPitch=std::max(-0.6,std::min(0.6,aimPitch+dt*1.2*pad.sThumbRY/32767.0));
         pad.sThumbLX=0;
-    } else if(std::abs(pad.sThumbRX)>deadzone) {
-        yaw+=int(dt*camTurnRate*pad.sThumbRX/32767.0);
+    } else {
+        if(std::abs(pad.sThumbRX)>deadzone) yaw+=int(dt*camTurnRate*pad.sThumbRX/32767.0);
+        if(std::abs(pad.sThumbRY)>deadzone)
+            lookPitch=std::max(-0.5,std::min(0.5,lookPitch+dt*1.2*pad.sThumbRY/32767.0));
     }
     camYaw=yaw&0xfff;
     camAiming=aiming;
@@ -1017,6 +1020,42 @@ constexpr uintptr_t DISPATCH=0x5f30e0, PRESENT_CALLBACK=0x67c018, RENDER_SCENE=0
     BUFFER_INDEX=0x6d3e24, BUFFER_DESC=0x6de994, DESCS=0x6d3ce0,
     GAME_BLOCK=0x67b868;
 struct CameraState { int16_t matrix[9], eye[3], angles[3], target[3], view[3]; };
+
+// The cutscene bars. FUN_00409773 runs once a tick, outside the scene passes:
+// it fades the bars in and out (strength gameState+0x70) and queues two
+// subtractive tiles, 320x28 at the top and the bottom of the screen, on the
+// main list's entry 2, unless state flag (10, 0xC) hides them. The extra
+// frame queues the same tiles, or the bars would show only every other frame.
+typedef int (__cdecl *FlagFn)(int group, int bit);
+typedef void (__cdecl *TileFn)(void* tile);
+typedef void (__cdecl *SemiTransFn)(void* tile, int on);
+typedef uint32_t (__cdecl *TPageFn)(int tp, int abr, int x, int y);
+typedef void (__cdecl *DrawModeFn)(void* packet, int dfe, int dtd, int tpage, uintptr_t tw);
+static void queueCutsceneBars(uintptr_t g, uint8_t buffer) {
+    if(reinterpret_cast<FlagFn>(0x40764b)(10,0xc)) return;
+    auto block=*reinterpret_cast<uintptr_t**>(GAME_BLOCK);
+    auto ot=reinterpret_cast<volatile uint32_t*>(0x6d1c48+buffer*0x1000);
+    auto link=[&](size_t size) {
+        auto packet=reinterpret_cast<uint32_t*>(block[1]);
+        *packet=(*packet&0x80000000)|(*ot&0x7fffffff);
+        *ot=(*ot&0x80000000)|uint32_t(block[1]);
+        block[1]+=size;
+    };
+    uint8_t tile[16]={};
+    reinterpret_cast<TileFn>(0x5f2f10)(tile);
+    reinterpret_cast<SemiTransFn>(0x5f2ed0)(tile,1);
+    tile[4]=tile[5]=tile[6]=*reinterpret_cast<volatile uint8_t*>(g+0x70);
+    *reinterpret_cast<int16_t*>(tile+12)=0x140;
+    *reinterpret_cast<int16_t*>(tile+14)=0x1c;
+    for(int16_t y : {int16_t(0),int16_t(0xd4)}) {
+        *reinterpret_cast<int16_t*>(tile+10)=y;
+        memcpy(reinterpret_cast<void*>(block[1]),tile,sizeof(tile));
+        link(sizeof(tile));
+    }
+    uint32_t tpage=reinterpret_cast<TPageFn>(0x5f2a80)(0,2,0x140,0x100)&0xffff;
+    reinterpret_cast<DrawModeFn>(0x5f2d60)(reinterpret_cast<void*>(block[1]),0,0,int(tpage),0);
+    link(0xc);
+}
 static CameraState camPrev, camCur;
 
 // Characters: the 11 actors at gameState+0x288 (0x260 bytes each, Regina is
@@ -1033,6 +1072,15 @@ struct ActorPose {
 };
 static ActorPose poses[3][ACTORS];      // [0] this tick, [1] the one before, [2] before that
 static bool posesValid[3];
+// The bones as each tick drew them. Their world pose is worked out at the end
+// of a scene, for the next tick, but the tick's logic changes some before the
+// scene draws them: aiming turns her arm toward the target. Taken after the
+// tick's logic, the blend missed that, and her arm shook between the aimed
+// pose and the plain one every frame. So the gameplay scene call (0x433B4D)
+// takes the snapshot first.
+static ActorPose drawn[2][ACTORS];      // [0] this tick's scene, [1] the one before
+static bool drawnFresh, drawnOk[2];
+constexpr uintptr_t SCENE_CALL=0x433b4d;
 
 static void readPoses(uintptr_t g, ActorPose* out) {
     for(int i=0;i<ACTORS;i++) {
@@ -1121,7 +1169,7 @@ static void restorePieces(uintptr_t g, const PiecePose saved[2][60]) {
 static void blendPoses(uintptr_t g, float t, ActorPose* saved) {
     readPoses(g,saved);
     for(int i=0;i<ACTORS;i++) {
-        const ActorPose &r0=poses[1][i], &r1=poses[0][i], &b0=poses[2][i], &b1=poses[1][i];
+        const ActorPose &r0=poses[1][i], &r1=poses[0][i], &b0=drawn[1][i], &b1=drawn[0][i];
         uintptr_t a=g+0x288+i*0x260;
         if(!saved[i].valid) continue;
         if(posesValid[1] && r0.valid && r1.valid && closeEnough(r0.pos,r1.pos,r0.ang,r1.ang))
@@ -1129,7 +1177,7 @@ static void blendPoses(uintptr_t g, float t, ActorPose* saved) {
                 *reinterpret_cast<volatile int16_t*>(a+0x20+2*k)=lerpShort(r0.pos[k],r1.pos[k],t);
                 *reinterpret_cast<volatile int16_t*>(a+0x28+2*k)=lerpAngle(r0.ang[k],r1.ang[k],t);
             }
-        if(!(posesValid[2] && b0.valid && b1.valid && b0.first==b1.first && b0.bones==b1.bones &&
+        if(!(drawnOk[0] && drawnOk[1] && b0.valid && b1.valid && b0.first==b1.first && b0.bones==b1.bones &&
              b1.first==saved[i].first && b1.bones==saved[i].bones)) continue;
         uintptr_t b=b0.first;
         for(int n=0;n<b0.bones;n++) {
@@ -1236,6 +1284,7 @@ static void renderExtraFrame(uintptr_t g, float t) {
     blendPoses(g,t,savedPoses);
     if(posesValid[1]) blendPieces(g,t,savedPieces); else readPieces(g,savedPieces);
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    queueCutsceneBars(g,idle);
     restorePieces(g,savedPieces);
     restorePoses(g,savedPoses);
     reinterpret_cast<PtrFn>(PUT_DRAW_ENV)(idleDesc);
@@ -1270,16 +1319,29 @@ static int __cdecl dispatchHook(int count) {
         memmove(poses[1],poses[0],sizeof(poses[0])*2);
         posesValid[2]=posesValid[1]; posesValid[1]=posesValid[0];
         readPoses(g,poses[0]); posesValid[0]=scene && !cut;
+        drawnOk[1]=drawnOk[0]; drawnOk[0]=drawnFresh && scene && !cut; drawnFresh=false;
         memcpy(pieces[1],pieces[0],sizeof(pieces[0]));
         readPieces(g,pieces[0]);
         ok=scene && !cut;
-    } else { camPrevValid=false; posesValid[0]=posesValid[1]=posesValid[2]=false; }
+    } else {
+        camPrevValid=false; posesValid[0]=posesValid[1]=posesValid[2]=false;
+        drawnOk[0]=drawnOk[1]=drawnFresh=false;
+    }
     if(!ok) return dispatch(count);
     auto present=*reinterpret_cast<VoidFn*>(PRESENT_CALLBACK);
     present();
     renderExtraFrame(g,0.5f);
     present();
     return 0;
+}
+
+static void __cdecl sceneHook() {
+    if(uintptr_t g=gameState()) {
+        memcpy(drawn[1],drawn[0],sizeof(drawn[0]));
+        readPoses(g,drawn[0]);
+        drawnFresh=true;
+    }
+    reinterpret_cast<VoidFn>(RENDER_SCENE)();
 }
 
 static void hookDispatch() {
@@ -1291,6 +1353,11 @@ static void hookDispatch() {
     auto slot=reinterpret_cast<uintptr_t*>(rebirth+0x14a2);
     auto thunk=rebirth+0x149c;
     if(thunk[0]!=0xff || thunk[1]!=0x25 || *slot!=DISPATCH) return;
+    auto call=reinterpret_cast<uint8_t*>(SCENE_CALL);
+    if(call[0]!=0xe8 || SCENE_CALL+5+*reinterpret_cast<int32_t*>(call+1)!=RENDER_SCENE) return;
+    uint8_t rel[5]={0xe8};
+    *reinterpret_cast<int32_t*>(rel+1)=int32_t(reinterpret_cast<uintptr_t>(sceneHook)-(SCENE_CALL+5));
+    applyPatch(call,rel,sizeof(rel));
     uintptr_t hook=reinterpret_cast<uintptr_t>(dispatchHook);
     applyPatch(slot,reinterpret_cast<uint8_t*>(&hook),sizeof(hook));
 }
