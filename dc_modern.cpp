@@ -18,6 +18,10 @@
 // import names it (install.py). Either way the real XInputGetState is loaded
 // by full path from the system directory, never by name, so it cannot find
 // itself.
+// Classic REbirth replaces the game's polygon builders, vertex projection and
+// winding test with its own and draws through Direct3D 9: anything that
+// decides which polygons reach the screen must be patched in REbirth's code,
+// not the game's (docs/classic-rebirth.md).
 static HMODULE self;
 static SRWLOCK lock = SRWLOCK_INIT;
 static char ini[MAX_PATH];

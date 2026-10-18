@@ -69,8 +69,15 @@ the features a controller state alone can't do:
   each polygon's depth instead of the fixed per-piece order made for the
   fixed cameras.
 
+- **Faces seen from behind.** The rooms were modelled for the fixed cameras,
+  so many walls and fences only exist on one side. With the shoulder camera
+  on, the mod tells Classic REbirth to keep those faces too. REbirth, not the
+  game, builds and draws the polygons, through Direct3D 9. See
+  [Classic REbirth owns the geometry](docs/classic-rebirth.md) before patching
+  anything that draws.
+
 The addresses are for the Classic REbirth build of the game. The DLL checks the
-executable's code before it changes anything.
+executable's code, and REbirth's, before it changes anything.
 
 ## Credits
 
