@@ -349,17 +349,46 @@ static uint64_t meshesSorted;
 static uintptr_t meshesState;
 static uint8_t meshSort[ROOM_MESH_COUNT];
 
+// Classic REbirth replaces the room's polygon builders with its own (the
+// game's 0x5F18F0 and 0x5F1AD0 start with a jump into ddraw.dll), and those
+// drop a polygon facing away from the camera. Walls and fences exist only on
+// the side a fixed camera sees, so from the shoulder a fence seen from behind
+// vanished while its collision stayed. While the shoulder camera is on: the
+// quad builder's `jl` after its winding test (ddraw.dll 0x100549B4, preferred
+// base 0x10000000) becomes NOPs, and the triangle builder's unsigned `ja`
+// (0x100546D3), which drops both back faces and huge triangles, becomes a
+// signed `jg`, which still drops the huge ones. Any other REbirth build is
+// left alone.
+struct ModulePatch { uintptr_t rva; uint8_t size; uint8_t original[6], patched[6]; };
+static const ModulePatch rebirthPatches[]={
+    {0x549b4,6,{0x0f,0x8c,0x59,0x02,0x00,0x00},{0x90,0x90,0x90,0x90,0x90,0x90}},
+    {0x546d3,6,{0x0f,0x87,0xde,0x01,0x00,0x00},{0x0f,0x8f,0xde,0x01,0x00,0x00}},
+};
+
+static bool applyPatch(void* at, const uint8_t* bytes, size_t size) {
+    DWORD old;
+    if(!VirtualProtect(at,size,PAGE_EXECUTE_READWRITE,&old)) return false;
+    memcpy(at,bytes,size);
+    VirtualProtect(at,size,old,&old);
+    FlushInstructionCache(GetCurrentProcess(),at,size);
+    return true;
+}
+
 static void drawWholeRoom(bool on) {
     if(on==wholeRoom) return;
     for(const CodePatch& p : roomPatches)
         if(memcmp(reinterpret_cast<void*>(p.at),on?p.original:p.patched,p.size)) return;
-    for(const CodePatch& p : roomPatches) {
-        void* at=reinterpret_cast<void*>(p.at);
-        DWORD old;
-        if(!VirtualProtect(at,p.size,PAGE_EXECUTE_READWRITE,&old)) continue;
-        memcpy(at,on?p.patched:p.original,p.size);
-        VirtualProtect(at,p.size,old,&old);
-        FlushInstructionCache(GetCurrentProcess(),at,p.size);
+    for(const CodePatch& p : roomPatches)
+        applyPatch(reinterpret_cast<void*>(p.at),on?p.patched:p.original,p.size);
+    if(auto rebirth=reinterpret_cast<uint8_t*>(GetModuleHandleA("ddraw.dll"))) {
+        auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(rebirth);
+        auto nt=reinterpret_cast<IMAGE_NT_HEADERS*>(rebirth+dos->e_lfanew);
+        bool known=nt->OptionalHeader.SizeOfImage>0x549ba;
+        for(const ModulePatch& p : rebirthPatches)
+            known=known && !memcmp(rebirth+p.rva,on?p.original:p.patched,p.size);
+        if(known)
+            for(const ModulePatch& p : rebirthPatches)
+                applyPatch(rebirth+p.rva,on?p.patched:p.original,p.size);
     }
     wholeRoom=on;
 }
