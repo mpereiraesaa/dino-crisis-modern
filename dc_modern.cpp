@@ -863,6 +863,56 @@ static bool closeEnough(const int16_t* a, const int16_t* b, const int16_t* ra, c
 static int16_t lerpShort(int a, int b, float t) { return int16_t(std::lround(a+(b-a)*t)); }
 static int16_t lerpAngle(int a, int b, float t) { return int16_t(a+std::lround(delta4096(b,a)*t)); }
 
+// Effects and moving room pieces: the 60 objects at gameState+0x5FD8 (0x7C
+// bytes; muzzle flashes, blood, casings and lamps come from here) and the 36
+// room meshes at +0x7CE8 (0x88 bytes; doors, fans). Each has a world
+// position (+0x20) and angles (+0x28) that the scene reads after the tick's
+// logic, as it does an actor's root. A slot blends only while it holds the
+// same thing (+0x3C) and does not jump; one just spawned or gone is drawn
+// as it is.
+struct PieceTable { uintptr_t offset, stride; int count; };
+static const PieceTable pieceTables[2]={{0x5fd8,0x7c,60},{0x7ce8,0x88,36}};
+struct PiecePose { bool valid; uint32_t kind; int16_t pos[3], ang[3]; };
+static PiecePose pieces[2][2][60];        // [0] this tick, [1] the one before; [table][slot]
+
+static void readPieces(uintptr_t g, PiecePose out[2][60]) {
+    for(int t=0;t<2;t++)
+        for(int i=0;i<pieceTables[t].count;i++) {
+            uintptr_t a=g+pieceTables[t].offset+i*pieceTables[t].stride;
+            PiecePose& p=out[t][i];
+            p.valid=(*reinterpret_cast<volatile uint32_t*>(a+0x30)&1)!=0;
+            p.kind=*reinterpret_cast<volatile uint32_t*>(a+0x3c);
+            for(int k=0;k<3;k++) {
+                p.pos[k]=*reinterpret_cast<volatile int16_t*>(a+0x20+2*k);
+                p.ang[k]=*reinterpret_cast<volatile int16_t*>(a+0x28+2*k);
+            }
+        }
+}
+static void blendPieces(uintptr_t g, float t, PiecePose saved[2][60]) {
+    readPieces(g,saved);
+    for(int tb=0;tb<2;tb++)
+        for(int i=0;i<pieceTables[tb].count;i++) {
+            const PiecePose &a0=pieces[1][tb][i], &a1=pieces[0][tb][i], &now=saved[tb][i];
+            if(!now.valid || !a0.valid || !a1.valid || a0.kind!=a1.kind || a1.kind!=now.kind ||
+               !closeEnough(a0.pos,a1.pos,a0.ang,a1.ang)) continue;
+            uintptr_t a=g+pieceTables[tb].offset+i*pieceTables[tb].stride;
+            for(int k=0;k<3;k++) {
+                *reinterpret_cast<volatile int16_t*>(a+0x20+2*k)=lerpShort(a0.pos[k],a1.pos[k],t);
+                *reinterpret_cast<volatile int16_t*>(a+0x28+2*k)=lerpAngle(a0.ang[k],a1.ang[k],t);
+            }
+        }
+}
+static void restorePieces(uintptr_t g, const PiecePose saved[2][60]) {
+    for(int tb=0;tb<2;tb++)
+        for(int i=0;i<pieceTables[tb].count;i++) {
+            uintptr_t a=g+pieceTables[tb].offset+i*pieceTables[tb].stride;
+            for(int k=0;k<3;k++) {
+                *reinterpret_cast<volatile int16_t*>(a+0x20+2*k)=saved[tb][i].pos[k];
+                *reinterpret_cast<volatile int16_t*>(a+0x28+2*k)=saved[tb][i].ang[k];
+            }
+        }
+}
+
 // Writes poses blended at t, keeping what it overwrote in `saved`.
 static void blendPoses(uintptr_t g, float t, ActorPose* saved) {
     readPoses(g,saved);
@@ -978,8 +1028,11 @@ static void renderExtraFrame(uintptr_t g, float t) {
     clear(0x6de9a0+idle*0x10,4);
     writeCamera(g,mid);
     static ActorPose savedPoses[ACTORS];
+    static PiecePose savedPieces[2][60];
     blendPoses(g,t,savedPoses);
+    if(posesValid[1]) blendPieces(g,t,savedPieces); else readPieces(g,savedPieces);
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    restorePieces(g,savedPieces);
     restorePoses(g,savedPoses);
     reinterpret_cast<PtrFn>(PUT_DRAW_ENV)(idleDesc);
     reinterpret_cast<PtrFn>(PUT_DISP_ENV)(idleDesc+0x14);
@@ -1013,6 +1066,8 @@ static int __cdecl dispatchHook(int count) {
         memmove(poses[1],poses[0],sizeof(poses[0])*2);
         posesValid[2]=posesValid[1]; posesValid[1]=posesValid[0];
         readPoses(g,poses[0]); posesValid[0]=scene && !cut;
+        memcpy(pieces[1],pieces[0],sizeof(pieces[0]));
+        readPieces(g,pieces[0]);
         ok=scene && !cut;
     } else { camPrevValid=false; posesValid[0]=posesValid[1]=posesValid[2]=false; }
     if(!ok) return dispatch(count);
