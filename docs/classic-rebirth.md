@@ -58,3 +58,29 @@ bytes first and leave any other build alone.
 The offsets are for the REbirth build this mod was made with. If REbirth is
 updated, find the builders again: follow the `jmp` at 0x5F1AD0 and 0x5F18F0
 in the running game.
+
+## The frame loop
+
+REbirth also replaces the game's main loop (`HandlePersistentFrameLoop`,
+0x4055AA, jumps to ddraw.dll 0x1004DC00) and its frame-task functions
+(0x409431–0x40956D). Its own loop (0x1004DD10–0x1004DFBC) runs one tick
+per pass:
+
+1. `DispatchFrameOutputCallback` (0x5F30E0) with 2: the presentation
+   callback runs twice, once per 60 Hz vsync, so each image stays on screen
+   for two vsyncs and the game runs at 30. REbirth reaches it through a jump
+   thunk that reads its target from ddraw.dll 0x100014A2.
+2. Draw environment, then `DrawOTag` (0x5F2C90) on the list built during the
+   previous tick.
+3. Swap the double buffer (index 0x6D3E24, descriptor 0x6DE994) and clear its
+   lists (0x5F2A30), then input and the game's tasks (logic and
+   `RenderSceneGeometryPasses`, 0x44CBC2).
+
+REbirth keeps one packet area at `[0x67B86C]+0x1A6D00`, because it draws a
+list as soon as it is given one.
+
+The mod's 60 fps redirects that thunk. On the second vsync it builds the
+scene again with blended state into the idle half of the double buffer and a
+packet buffer of its own, draws and presents it, and restores everything
+before the next tick. REbirth only presents when something new was drawn,
+and draws text itself at present time, so messages show in every frame.

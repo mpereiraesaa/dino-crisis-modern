@@ -17,6 +17,15 @@ files and delete them to uninstall.
 - **Over-the-shoulder camera (optional).** RE4-style, turned with the right
   stick. It moves in close while you aim and stops at walls instead of going
   through them. F12 or R3 switches between it and the original fixed cameras.
+- **Free aim with a crosshair.** With the shoulder camera, aiming shows a
+  crosshair and the right stick moves the aim freely, left, right, up and
+  down. Shots go where the crosshair points, height included, instead of
+  the game's auto-aim cone.
+- **60 fps.** The game still runs at its original 30 ticks a second, so its
+  speed, timing and AI don't change. Between ticks the mod shows an extra
+  frame with the camera, characters and effects halfway between them.
+  Menus, the inventory and videos stay at 30. `[Display] FrameRate=30` turns
+  it off.
 
 The levels were only built for the fixed cameras, so the shoulder camera can
 show black void at the edge of the map.
@@ -69,6 +78,14 @@ the features a controller state alone can't do:
   each polygon's depth instead of the fixed per-piece order made for the
   fixed cameras.
 
+- **Free aim.** Every weapon asks one game function which enemies a shot
+  reaches. With the shoulder camera, the mod answers it with a ray from the
+  camera through the crosshair, and the game's own damage and reactions
+  take it from there.
+- **60 fps.** Classic REbirth presents each 30 Hz tick for two 60 Hz
+  vsyncs. On the second one the mod builds the scene again with the camera,
+  bones and effects blended between the last two ticks, draws it into the
+  idle half of the double buffer and shows it, then puts everything back.
 - **Faces seen from behind.** The rooms were modelled for the fixed cameras,
   so many walls and fences only exist on one side. With the shoulder camera
   on, the mod tells Classic REbirth to keep those faces too. REbirth, not the
@@ -82,6 +99,9 @@ executable's code, and REbirth's, before it changes anything.
 ## Credits
 
 - Gemini and the Classic REbirth team, for making the PC port playable.
+- [REuncap](https://github.com/NobodyCatchMe-AZ92/REuncap) by
+  NobodyCatchMe-AZ92 (MIT), which showed how to add frames between ticks
+  for the Classic REbirth Resident Evil games. Its idea is adapted here.
 - Capcom, for Dino Crisis.
 
 This project is not affiliated with Capcom.
