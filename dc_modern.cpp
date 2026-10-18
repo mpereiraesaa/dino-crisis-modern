@@ -26,8 +26,8 @@ static DWORD configTime;
 static int enabled=1, onPercent=75, offPercent=65;
 static int modern=1, turnRate=4096*2, deadzone=8000, holdCamera=1;
 static int triggers=1, triggerThreshold=77, faceButtons=1, doorSkip=1;
-static int cameraMode=0, camDistance=1700, camHeight=1450, camSide=420,
-           camLook=2600, camLookHeight=1250, camTurnRate=4096/2,
+static int cameraMode=0, camDistance=1700, camHeight=1850, camSide=520,
+           camLook=2800, camLookHeight=1550, camTurnRate=4096/2,
            camCollide=1, camRadius=200, camRiseWhenClose=500, camMinDistance=550;
 static WORD runButton=XINPUT_GAMEPAD_X;
 static LARGE_INTEGER frequency;
@@ -84,10 +84,10 @@ static void config() {
     GetPrivateProfileStringA("Camera","Mode","Fixed",mode,sizeof(mode),ini);
     cameraMode=!lstrcmpiA(mode,"Modern");
     camDistance=GetPrivateProfileIntA("Camera","Distance",1700,ini);
-    camHeight=GetPrivateProfileIntA("Camera","Height",1450,ini);
-    camSide=GetPrivateProfileIntA("Camera","SideOffset",420,ini);
-    camLook=GetPrivateProfileIntA("Camera","LookAhead",2600,ini);
-    camLookHeight=GetPrivateProfileIntA("Camera","LookHeight",1250,ini);
+    camHeight=GetPrivateProfileIntA("Camera","Height",1850,ini);
+    camSide=GetPrivateProfileIntA("Camera","SideOffset",520,ini);
+    camLook=GetPrivateProfileIntA("Camera","LookAhead",2800,ini);
+    camLookHeight=GetPrivateProfileIntA("Camera","LookHeight",1550,ini);
     camTurnRate=GetPrivateProfileIntA("Camera","TurnDegreesPerSecond",180,ini)*4096/360;
     camCollide=GetPrivateProfileIntA("Camera","Collision",1,ini);
     camRadius=std::max(40,std::min(600,(int)GetPrivateProfileIntA("Camera","CollisionRadius",200,ini)));
