@@ -1387,8 +1387,9 @@ static int __cdecl dispatchHook(int count) {
         auto outer=*reinterpret_cast<volatile uint16_t*>(g+0x28);
         auto sub=*reinterpret_cast<volatile uint16_t*>(g+0x2a);
         auto pauseFlags=*reinterpret_cast<volatile uint32_t*>(g+0x3c);
+        // Not gameState+0x54: the game-over screen sets it and Continue
+        // never clears it.
         bool scene=outer==3 && sub==0 && !(pauseFlags&0x20000000) &&
-            !*reinterpret_cast<volatile uint8_t*>(g+0x54) &&
             !(*reinterpret_cast<volatile uint8_t*>(g+0x38)&0x80) &&
             !*reinterpret_cast<volatile uint8_t*>(g+0x6d);
         CameraState now=readCamera(g);
