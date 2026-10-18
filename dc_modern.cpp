@@ -814,6 +814,99 @@ constexpr uintptr_t DISPATCH=0x5f30e0, PRESENT_CALLBACK=0x67c018, RENDER_SCENE=0
     GAME_BLOCK=0x67b868;
 struct CameraState { int16_t matrix[9], eye[3], angles[3], target[3], view[3]; };
 static CameraState camPrev, camCur;
+
+// Characters: the 11 actors at gameState+0x288 (0x260 bytes each, Regina is
+// the 11th). An actor's root has its world position (+0x20) and angles
+// (+0x28); its bones (first at +0x4C, count at +0x50, next at bone+0x34)
+// carry world positions and angles too, which the renderer turns into
+// matrices. UpdateActorNodeWorldTransforms writes the bones at the end of
+// a tick's scene, for the next tick's: bones lag the root and the camera by
+// one tick, so they blend one tick further back.
+constexpr int ACTORS=11, MAX_BONES=32;
+struct ActorPose {
+    bool valid; uintptr_t first; int bones;
+    int16_t pos[3], ang[3], bonePos[MAX_BONES][3], boneAng[MAX_BONES][3];
+};
+static ActorPose poses[3][ACTORS];      // [0] this tick, [1] the one before, [2] before that
+static bool posesValid[3];
+
+static void readPoses(uintptr_t g, ActorPose* out) {
+    for(int i=0;i<ACTORS;i++) {
+        uintptr_t a=g+0x288+i*0x260;
+        ActorPose& p=out[i];
+        p.valid=(*reinterpret_cast<volatile uint32_t*>(a+0x30)&1)!=0;
+        if(!p.valid) continue;
+        p.first=*reinterpret_cast<volatile uint32_t*>(a+0x4c);
+        p.bones=int(*reinterpret_cast<volatile uint32_t*>(a+0x50));
+        if(p.bones<0 || p.bones>MAX_BONES || (p.bones && !readable(p.first,0xac))) { p.valid=false; continue; }
+        for(int k=0;k<3;k++) {
+            p.pos[k]=*reinterpret_cast<volatile int16_t*>(a+0x20+2*k);
+            p.ang[k]=*reinterpret_cast<volatile int16_t*>(a+0x28+2*k);
+        }
+        uintptr_t b=p.first;
+        for(int n=0;n<p.bones;n++) {
+            if(!readable(b,0x38)) { p.valid=false; break; }
+            for(int k=0;k<3;k++) {
+                p.bonePos[n][k]=*reinterpret_cast<volatile int16_t*>(b+0x20+2*k);
+                p.boneAng[n][k]=*reinterpret_cast<volatile int16_t*>(b+0x28+2*k);
+            }
+            b=*reinterpret_cast<volatile uint32_t*>(b+0x34);
+        }
+    }
+}
+
+static bool closeEnough(const int16_t* a, const int16_t* b, const int16_t* ra, const int16_t* rb) {
+    for(int k=0;k<3;k++)
+        if(std::abs(a[k]-b[k])>1500 || std::abs(delta4096(ra[k],rb[k]))>1024) return false;
+    return true;
+}
+static int16_t lerpShort(int a, int b, float t) { return int16_t(std::lround(a+(b-a)*t)); }
+static int16_t lerpAngle(int a, int b, float t) { return int16_t(a+std::lround(delta4096(b,a)*t)); }
+
+// Writes poses blended at t, keeping what it overwrote in `saved`.
+static void blendPoses(uintptr_t g, float t, ActorPose* saved) {
+    readPoses(g,saved);
+    for(int i=0;i<ACTORS;i++) {
+        const ActorPose &r0=poses[1][i], &r1=poses[0][i], &b0=poses[2][i], &b1=poses[1][i];
+        uintptr_t a=g+0x288+i*0x260;
+        if(!saved[i].valid) continue;
+        if(posesValid[1] && r0.valid && r1.valid && closeEnough(r0.pos,r1.pos,r0.ang,r1.ang))
+            for(int k=0;k<3;k++) {
+                *reinterpret_cast<volatile int16_t*>(a+0x20+2*k)=lerpShort(r0.pos[k],r1.pos[k],t);
+                *reinterpret_cast<volatile int16_t*>(a+0x28+2*k)=lerpAngle(r0.ang[k],r1.ang[k],t);
+            }
+        if(!(posesValid[2] && b0.valid && b1.valid && b0.first==b1.first && b0.bones==b1.bones &&
+             b1.first==saved[i].first && b1.bones==saved[i].bones)) continue;
+        uintptr_t b=b0.first;
+        for(int n=0;n<b0.bones;n++) {
+            if(closeEnough(b0.bonePos[n],b1.bonePos[n],b0.boneAng[n],b1.boneAng[n]))
+                for(int k=0;k<3;k++) {
+                    *reinterpret_cast<volatile int16_t*>(b+0x20+2*k)=lerpShort(b0.bonePos[n][k],b1.bonePos[n][k],t);
+                    *reinterpret_cast<volatile int16_t*>(b+0x28+2*k)=lerpAngle(b0.boneAng[n][k],b1.boneAng[n][k],t);
+                }
+            b=*reinterpret_cast<volatile uint32_t*>(b+0x34);
+        }
+    }
+}
+static void restorePoses(uintptr_t g, const ActorPose* saved) {
+    for(int i=0;i<ACTORS;i++) {
+        const ActorPose& p=saved[i];
+        if(!p.valid) continue;
+        uintptr_t a=g+0x288+i*0x260;
+        for(int k=0;k<3;k++) {
+            *reinterpret_cast<volatile int16_t*>(a+0x20+2*k)=p.pos[k];
+            *reinterpret_cast<volatile int16_t*>(a+0x28+2*k)=p.ang[k];
+        }
+        uintptr_t b=p.first;
+        for(int n=0;n<p.bones;n++) {
+            for(int k=0;k<3;k++) {
+                *reinterpret_cast<volatile int16_t*>(b+0x20+2*k)=p.bonePos[n][k];
+                *reinterpret_cast<volatile int16_t*>(b+0x28+2*k)=p.boneAng[n][k];
+            }
+            b=*reinterpret_cast<volatile uint32_t*>(b+0x34);
+        }
+    }
+}
 static bool camPrevValid;
 static uint8_t camZonePrev;
 
@@ -884,7 +977,10 @@ static void renderExtraFrame(uintptr_t g, float t) {
     clear(0x6d3e00+idle*0xc,3);
     clear(0x6de9a0+idle*0x10,4);
     writeCamera(g,mid);
+    static ActorPose savedPoses[ACTORS];
+    blendPoses(g,t,savedPoses);
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    restorePoses(g,savedPoses);
     reinterpret_cast<PtrFn>(PUT_DRAW_ENV)(idleDesc);
     reinterpret_cast<PtrFn>(PUT_DISP_ENV)(idleDesc+0x14);
     reinterpret_cast<PtrFn>(DRAW_OT)(idleDesc+0x80);
@@ -914,8 +1010,11 @@ static int __cdecl dispatchHook(int count) {
             cut=std::abs(now.target[i]-camCur.target[i])>2500 || std::abs(delta4096(now.angles[i],camCur.angles[i]))>500;
         camPrev=camCur; camCur=now; camZonePrev=zone;
         camPrevValid=scene;
+        memmove(poses[1],poses[0],sizeof(poses[0])*2);
+        posesValid[2]=posesValid[1]; posesValid[1]=posesValid[0];
+        readPoses(g,poses[0]); posesValid[0]=scene && !cut;
         ok=scene && !cut;
-    } else camPrevValid=false;
+    } else { camPrevValid=false; posesValid[0]=posesValid[1]=posesValid[2]=false; }
     if(!ok) return dispatch(count);
     auto present=*reinterpret_cast<VoidFn*>(PRESENT_CALLBACK);
     present();
