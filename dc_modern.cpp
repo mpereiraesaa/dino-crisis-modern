@@ -28,6 +28,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static char ini[MAX_PATH];
 static bool configured, supported;
 static DWORD configTime;
+static int interpolate=0;
 static int enabled=1, onPercent=75, offPercent=65;
 static int modern=1, turnRate=4096*2, deadzone=8000, holdCamera=1;
 static int triggers=1, triggerThreshold=77, faceButtons=1, doorSkip=1;
@@ -98,6 +99,7 @@ static void config() {
     camRadius=std::max(40,std::min(600,(int)GetPrivateProfileIntA("Camera","CollisionRadius",200,ini)));
     camRiseWhenClose=GetPrivateProfileIntA("Camera","RiseWhenClose",500,ini);
     camMinDistance=GetPrivateProfileIntA("Camera","MinDistance",550,ini);
+    interpolate=GetPrivateProfileIntA("Debug","Interpolate",0,ini);
     configTime=now;
 }
 
@@ -524,10 +526,12 @@ static void hookHitTest() {
     applyPatch(entry,jump,6);
 }
 
+static void hookDispatch();
 static void hookCameraCallbacks() {
     if(callbacksHooked || !supported) return;
     callbacksHooked=true;
     hookHitTest();
+    hookDispatch();
     auto table=reinterpret_cast<CameraCallback*>(CAM_CALLBACKS);
     for(int i=0;i<CAM_CALLBACK_COUNT;i++) {
         auto entry=reinterpret_cast<uintptr_t>(table[i]);
@@ -790,6 +794,147 @@ static void hookDirect3D() {
             return;
         }
     }
+}
+
+// 60 fps (work in progress). The game ticks at 30: Classic REbirth's frame
+// loop (ddraw.dll 0x1004DD10) calls DispatchFrameOutputCallback (0x5F30E0)
+// with 2, so every image is presented for two 60 Hz vsyncs. The second one
+// shows an extra frame instead: the scene is built again, with the camera
+// halfway between the last two ticks, into the idle half of the double
+// buffer, drawn and presented; then everything is put back, so the next tick
+// runs exactly as before. Only the call from REbirth's loop is redirected
+// (its jump thunk reads the target from ddraw.dll 0x100014A2).
+typedef int (__cdecl *DispatchFn)(int);
+typedef void (__cdecl *VoidFn)();
+typedef void (__cdecl *ClearOTFn)(uintptr_t ot, int count);
+typedef void (__cdecl *PtrFn)(uintptr_t);
+constexpr uintptr_t DISPATCH=0x5f30e0, PRESENT_CALLBACK=0x67c018, RENDER_SCENE=0x44cbc2,
+    CLEAR_OT=0x5f2a30, DRAW_OT=0x5f2c90, PUT_DRAW_ENV=0x5f1ee0, PUT_DISP_ENV=0x5f1fb0,
+    BUFFER_INDEX=0x6d3e24, BUFFER_DESC=0x6de994, DESCS=0x6d3ce0,
+    GAME_BLOCK=0x67b868;
+struct CameraState { int16_t matrix[9], eye[3], angles[3], target[3], view[3]; };
+static CameraState camPrev, camCur;
+static bool camPrevValid;
+static uint8_t camZonePrev;
+
+static CameraState readCamera(uintptr_t g) {
+    CameraState c;
+    for(int i=0;i<9;i++) c.matrix[i]=*reinterpret_cast<volatile int16_t*>(g+0xb4+2*i);
+    for(int i=0;i<3;i++) {
+        c.eye[i]=*reinterpret_cast<volatile int16_t*>(g+0xd4+2*i);
+        c.angles[i]=*reinterpret_cast<volatile int16_t*>(g+0xdc+2*i);
+        c.target[i]=*reinterpret_cast<volatile int16_t*>(g+0xe4+2*i);
+        c.view[i]=*reinterpret_cast<volatile int16_t*>(g+0xec+2*i);
+    }
+    return c;
+}
+static void writeCamera(uintptr_t g, const CameraState& c) {
+    for(int i=0;i<3;i++) {
+        *reinterpret_cast<volatile int16_t*>(g+0xd4+2*i)=c.eye[i];
+        *reinterpret_cast<volatile int16_t*>(g+0xdc+2*i)=c.angles[i];
+        *reinterpret_cast<volatile int16_t*>(g+0xe4+2*i)=c.target[i];
+        *reinterpret_cast<volatile int16_t*>(g+0xec+2*i)=c.view[i];
+    }
+    for(int i=0;i<9;i++) *reinterpret_cast<volatile int16_t*>(g+0xb4+2*i)=c.matrix[i];
+}
+
+// The camera's rotation (Q12, rows) blended between two ticks: each row
+// interpolated, then made orthonormal again (Gram-Schmidt).
+static void blendRotation(const int16_t* a, const int16_t* b, float t, int16_t* out) {
+    double r[3][3];
+    for(int i=0;i<3;i++) for(int j=0;j<3;j++) r[i][j]=a[i*3+j]+(b[i*3+j]-a[i*3+j])*t;
+    auto norm=[](double* v){ double l=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(l>1e-9) for(int k=0;k<3;k++) v[k]/=l; };
+    auto dot=[](const double* x,const double* y){ return x[0]*y[0]+x[1]*y[1]+x[2]*y[2]; };
+    norm(r[0]);
+    double d=dot(r[1],r[0]); for(int k=0;k<3;k++) r[1][k]-=d*r[0][k];
+    norm(r[1]);
+    double d0=dot(r[2],r[0]), d1=dot(r[2],r[1]); for(int k=0;k<3;k++) r[2][k]-=d0*r[0][k]+d1*r[1][k];
+    norm(r[2]);
+    for(int i=0;i<3;i++) for(int j=0;j<3;j++) out[i*3+j]=int16_t(std::lround(r[i][j]*4096));
+}
+
+static void renderExtraFrame(uintptr_t g, float t) {
+    CameraState mid;
+    for(int i=0;i<3;i++) {
+        auto lerp=[t](int a,int b){ return int16_t(std::lround(a+(b-a)*t)); };
+        mid.eye[i]=lerp(camPrev.eye[i],camCur.eye[i]);
+        mid.target[i]=lerp(camPrev.target[i],camCur.target[i]);
+        mid.view[i]=lerp(camPrev.view[i],camCur.view[i]);
+        mid.angles[i]=int16_t(camPrev.angles[i]+std::lround(delta4096(camCur.angles[i],camPrev.angles[i])*t));
+    }
+    blendRotation(camPrev.matrix,camCur.matrix,t,mid.matrix);
+    uint8_t saved[0x50];
+    memcpy(saved,reinterpret_cast<void*>(g+0xb4),sizeof(saved));
+    auto block=*reinterpret_cast<uintptr_t**>(GAME_BLOCK);
+    uint8_t index=*reinterpret_cast<volatile uint8_t*>(BUFFER_INDEX);
+    uintptr_t desc=*reinterpret_cast<volatile uintptr_t*>(BUFFER_DESC), packets=block[1];
+    // The idle half: its list was drawn last tick. Packets go to a buffer of
+    // our own: the game's second packet area is too small once the shoulder
+    // camera draws whole rooms.
+    static uint8_t* extraPackets=static_cast<uint8_t*>(VirtualAlloc(nullptr,1<<20,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));
+    if(!extraPackets) return;
+    uint8_t idle=index^1;
+    uintptr_t idleDesc=DESCS+idle*0x84;
+    *reinterpret_cast<volatile uint8_t*>(BUFFER_INDEX)=idle;
+    *reinterpret_cast<volatile uintptr_t*>(BUFFER_DESC)=idleDesc;
+    block[1]=reinterpret_cast<uintptr_t>(extraPackets);
+    auto clear=reinterpret_cast<ClearOTFn>(CLEAR_OT);
+    clear(idleDesc+0x70,5);
+    clear(0x6d1c40+idle*0x1000,0x400);
+    clear(0x6d3e00+idle*0xc,3);
+    clear(0x6de9a0+idle*0x10,4);
+    writeCamera(g,mid);
+    reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    reinterpret_cast<PtrFn>(PUT_DRAW_ENV)(idleDesc);
+    reinterpret_cast<PtrFn>(PUT_DISP_ENV)(idleDesc+0x14);
+    reinterpret_cast<PtrFn>(DRAW_OT)(idleDesc+0x80);
+    memcpy(reinterpret_cast<void*>(g+0xb4),saved,sizeof(saved));
+    block[1]=packets;
+    *reinterpret_cast<volatile uintptr_t*>(BUFFER_DESC)=desc;
+    *reinterpret_cast<volatile uint8_t*>(BUFFER_INDEX)=index;
+}
+
+static int __cdecl dispatchHook(int count) {
+    auto dispatch=reinterpret_cast<DispatchFn>(DISPATCH);
+    uintptr_t g=gameState();
+    bool ok=false;
+    if(g && count==2 && interpolate) {
+        auto outer=*reinterpret_cast<volatile uint16_t*>(g+0x28);
+        auto sub=*reinterpret_cast<volatile uint16_t*>(g+0x2a);
+        auto pauseFlags=*reinterpret_cast<volatile uint32_t*>(g+0x3c);
+        bool scene=outer==3 && sub==0 && !(pauseFlags&0x20000000) &&
+            !*reinterpret_cast<volatile uint8_t*>(g+0x54) &&
+            !(*reinterpret_cast<volatile uint8_t*>(g+0x38)&0x80) &&
+            !*reinterpret_cast<volatile uint8_t*>(g+0x6d);
+        CameraState now=readCamera(g);
+        uint8_t zone=*reinterpret_cast<volatile uint8_t*>(g+0x110);
+        // A cut or a jump: nothing to blend.
+        bool cut=!camPrevValid || zone!=camZonePrev;
+        for(int i=0;i<3 && !cut;i++)
+            cut=std::abs(now.target[i]-camCur.target[i])>2500 || std::abs(delta4096(now.angles[i],camCur.angles[i]))>500;
+        camPrev=camCur; camCur=now; camZonePrev=zone;
+        camPrevValid=scene;
+        ok=scene && !cut;
+    } else camPrevValid=false;
+    if(!ok) return dispatch(count);
+    auto present=*reinterpret_cast<VoidFn*>(PRESENT_CALLBACK);
+    present();
+    renderExtraFrame(g,0.5f);
+    present();
+    return 0;
+}
+
+static void hookDispatch() {
+    static bool done;
+    if(done) return;
+    done=true;
+    auto rebirth=reinterpret_cast<uint8_t*>(GetModuleHandleA("ddraw.dll"));
+    if(!rebirth) return;
+    auto slot=reinterpret_cast<uintptr_t*>(rebirth+0x14a2);
+    auto thunk=rebirth+0x149c;
+    if(thunk[0]!=0xff || thunk[1]!=0x25 || *slot!=DISPATCH) return;
+    uintptr_t hook=reinterpret_cast<uintptr_t>(dispatchHook);
+    applyPatch(slot,reinterpret_cast<uint8_t*>(&hook),sizeof(hook));
 }
 
 // XInputGetState clears the guide button; XInputGetStateEx (ordinal 100 of
