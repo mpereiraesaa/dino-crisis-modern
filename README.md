@@ -29,9 +29,9 @@ files and delete them to uninstall.
 - **In-game menu.** Click both sticks (L3+R3) during play:
   - **Quick save** opens the save screen anywhere, not only at the save doors.
   - **Quick load** takes you to the game's load screen to pick a save.
-  - **All weapons** adds every weapon to your inventory.
-  - **Infinite ammo** (on/off) also means no reloads. It stays on between
-    sessions until you turn it off.
+  - **All weapons** adds every weapon and every weapon part.
+  - **Infinite ammo** (on/off): no reloads, and spare ammo and darts stay
+    at 99. It stays on between sessions until you turn it off.
 
 The levels were only built for the fixed cameras, so the shoulder camera can
 show black void at the edge of the map.

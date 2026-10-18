@@ -561,20 +561,64 @@ static volatile bool infiniteAmmo;
 static volatile int menuNotice;          // frames left showing "DONE"
 static WORD menuWithheld;
 
-// Infinite ammo: the four weapons' `mov [reg+...],cx/dx/ax` that store the
-// decremented count (from the SourceNext cheat table), as NOPs.
+// Infinite ammo: every weapon's `mov [reg+0x84/0x86/0x88],cx/dx/ax` that
+// stores the loaded count after a shot's `sub ...,1`, as NOPs. Each weapon
+// has its code twice or more (the variant tables of 0x650FF0: the auto-aim
+// option picks others); the SourceNext cheat table listed only the first four.
 struct AmmoSite { uintptr_t at; uint8_t original[7]; };
 static const AmmoSite ammoSites[]={
     {0x486c37,{0x66,0x89,0x8a,0x88,0x00,0x00,0x00}},
+    {0x489117,{0x66,0x89,0x8a,0x88,0x00,0x00,0x00}},
     {0x48b91f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
+    {0x48de9f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
     {0x49041f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
+    {0x49299f,{0x66,0x89,0x90,0x86,0x00,0x00,0x00}},
     {0x495001,{0x66,0x89,0x81,0x84,0x00,0x00,0x00}},
+    {0x4978e1,{0x66,0x89,0x81,0x84,0x00,0x00,0x00}},
+    {0x49a1c1,{0x66,0x89,0x81,0x84,0x00,0x00,0x00}},
+    {0x49ca71,{0x66,0x89,0x81,0x84,0x00,0x00,0x00}},
 };
+// And the spare ammo: the item scan at 0x430B40 (mov cl,[eax+1]; test ecx,ecx
+// reads a supply slot's count) is sent through a few bytes that first set
+// the count of any ammo (items 0x10..0x19: shells, bullets, the darts,
+// grenades) to 99, as the cheat table's "Infinite Ammo Count" did; the
+// medicine is left alone.
+constexpr uintptr_t ITEM_SCAN=0x430b40;
+static uint8_t* spareAmmoCode() {
+    static uint8_t* code;
+    if(code) return code;
+    code=static_cast<uint8_t*>(VirtualAlloc(nullptr,32,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE));
+    if(!code) return nullptr;
+    static const uint8_t body[19]={
+        0x80,0x38,0x10,             // cmp byte [eax],0x10
+        0x72,0x09,                  // jb  original
+        0x80,0x38,0x19,             // cmp byte [eax],0x19
+        0x77,0x04,                  // ja  original
+        0xc6,0x40,0x01,0x63,        // mov byte [eax+1],99
+        0x8a,0x48,0x01,             // original: mov cl,[eax+1]
+        0x85,0xc9};                 // test ecx,ecx
+    memcpy(code,body,sizeof(body));
+    code[19]=0xe9;
+    int32_t back=int32_t(ITEM_SCAN+5-(reinterpret_cast<uintptr_t>(code)+24));
+    memcpy(code+20,&back,4);
+    FlushInstructionCache(GetCurrentProcess(),code,32);
+    return code;
+}
 static void setInfiniteAmmo(bool on) {
     static const uint8_t nops[7]={0x90,0x90,0x90,0x90,0x90,0x90,0x90};
     for(const AmmoSite& a : ammoSites)
         if(!memcmp(reinterpret_cast<void*>(a.at),on?a.original:nops,7))
             applyPatch(reinterpret_cast<void*>(a.at),on?nops:a.original,7);
+    static const uint8_t scan[5]={0x8a,0x48,0x01,0x85,0xc9};
+    auto at=reinterpret_cast<uint8_t*>(ITEM_SCAN);
+    if(on && !memcmp(at,scan,5)) {
+        if(uint8_t* code=spareAmmoCode()) {
+            uint8_t jump[5]={0xe9};
+            int32_t rel=int32_t(reinterpret_cast<uintptr_t>(code)-(ITEM_SCAN+5));
+            memcpy(jump+1,&rel,4);
+            applyPatch(at,jump,5);
+        }
+    } else if(!on && at[0]==0xe9) applyPatch(at,scan,5);
     infiniteAmmo=on;
     WritePrivateProfileStringA("Cheats","InfiniteAmmo",on?"1":"0",ini);
 }
@@ -647,9 +691,9 @@ static bool menuInput(uintptr_t g, XINPUT_GAMEPAD& pad) {
         case ITEM_LOAD:
             loadStep=LOAD_LEAVE; menuOpen=false; break;
         case ITEM_WEAPONS:
-            // The owned-gear bits (0x6DD9D8): the weapons are added, and
-            // whatever else is owned (parts) is kept.
-            *reinterpret_cast<volatile uint16_t*>(0x6dd9d8)|=0x07fe;
+            // The owned-gear bits (0x6DD9D8): bits 1-10 the weapons, 11-15
+            // their parts; bit 0 is not gear and is kept.
+            *reinterpret_cast<volatile uint16_t*>(0x6dd9d8)|=0xfffe;
             menuNotice=45; break;
         case ITEM_AMMO:
             setInfiniteAmmo(!infiniteAmmo); break;
