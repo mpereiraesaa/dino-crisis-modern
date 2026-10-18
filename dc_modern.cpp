@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
+#include <d3d9.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -288,6 +289,9 @@ static void collideCamera(uintptr_t g, double fromX, double fromZ, double& toX, 
 
 static double camPull=1;                   // 0..1 of the wanted distance
 
+constexpr int AIM_HEIGHT=1250;           // the gun's height while aiming
+static volatile bool crosshairShown;
+
 static void placeShoulderCamera(uintptr_t g) {
     auto pos=reinterpret_cast<volatile int16_t*>(g+ACTOR+0x20);
     double a=camYaw*(3.14159265358979323846/2048.0), fx=std::sin(a), fz=std::cos(a);
@@ -316,9 +320,12 @@ static void placeShoulderCamera(uintptr_t g) {
     eye[0]=clamp16(ex);
     eye[1]=clamp16(pos[1]-camHeight-rise);
     eye[2]=clamp16(ez);
-    target[0]=clamp16(pos[0]+fx*camLook+rx*shoulder*0.5);
-    target[1]=clamp16(pos[1]-camLookHeight);
-    target[2]=clamp16(pos[2]+fz*camLook+rz*shoulder*0.5);
+    // Aiming, the target sits on the gun's line at chest height, so the
+    // crosshair in the middle of the screen marks where she shoots.
+    double side=aiming?0:shoulder*0.5;
+    target[0]=clamp16(pos[0]+fx*camLook+rx*side);
+    target[1]=clamp16(pos[1]-(aiming?AIM_HEIGHT:camLookHeight));
+    target[2]=clamp16(pos[2]+fz*camLook+rz*side);
     *reinterpret_cast<volatile int16_t*>(g+CAM_DISTANCE)=pointDistance(target,eye);
     computeViewAngles(target,eye,reinterpret_cast<volatile int16_t*>(g+CAM_ANGLES));
 }
@@ -500,12 +507,15 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
         play=outer==3 && mode==1 && !(pauseFlags&0x20000000) && !(flags&4);
         aiming=play && action==6;
     }
-    if(!camOn || !play || !callbacksHooked) { camHeld=false; return; }
+    if(!camOn || !play || !callbacksHooked) { camHeld=false; crosshairShown=false; return; }
 
     int yaw=camYaw;
     auto yawNow=*reinterpret_cast<volatile uint16_t*>(g+ACTOR+0x2a)&0xfff;
     if(!camHeld) yaw=yawNow;               // start behind her
     if(aiming) {
+        // The game turns her while she aims (the left stick, tank style); the
+        // right stick turns her too, as in modern shooters.
+        if(std::abs(pad.sThumbRX)>deadzone && std::abs(pad.sThumbLX)<=deadzone) pad.sThumbLX=pad.sThumbRX;
         int d=delta4096(yawNow,yaw);
         int step=int(dt*4096*2);
         yaw=std::abs(d)<=step?yawNow:yaw+(d>0?step:-step);
@@ -514,6 +524,7 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
     }
     camYaw=yaw&0xfff;
     camAiming=aiming;
+    crosshairShown=aiming;
     pad.sThumbRX=pad.sThumbRY=0;
     if(!camHeld) placeShoulderCamera(g);   // the steering below reads it now
     camHeld=true;
@@ -562,6 +573,134 @@ static int64_t steer(Pad& p, uintptr_t g, XINPUT_GAMEPAD& pad) {
     // Turn in place first when the new direction points well behind her.
     pad.sThumbLY=std::abs(delta4096(target,current))<0x400?static_cast<SHORT>(tilt):0;
     return pad.sThumbLY;
+}
+
+// The crosshair. REbirth draws through Direct3D 9 (d3d9!Direct3DCreate9 in
+// ddraw.dll's imports): its import is redirected here at load, the device's
+// Present is hooked when REbirth creates it (REbirth draws the game into a
+// texture and scales it onto the back buffer, so EndScene is too early), and
+// while she aims with the shoulder camera a crosshair is drawn on the back
+// buffer just before it is shown, REbirth's state and render target saved
+// and restored around it.
+typedef IDirect3D9* (WINAPI *Create9Fn)(UINT);
+typedef HRESULT (STDMETHODCALLTYPE *CreateDeviceFn)(IDirect3D9*,UINT,D3DDEVTYPE,HWND,DWORD,D3DPRESENT_PARAMETERS*,IDirect3DDevice9**);
+typedef HRESULT (STDMETHODCALLTYPE *PresentFn)(IDirect3DDevice9*,const RECT*,const RECT*,HWND,const RGNDATA*);
+static Create9Fn realCreate9;
+static CreateDeviceFn realCreateDevice;
+static PresentFn realPresent;
+
+static void hookVtable(void* object, int slot, void* hook, void** original) {
+    void** vtable=*reinterpret_cast<void***>(object);
+    if(vtable[slot]==hook) return;
+    DWORD old;
+    if(!VirtualProtect(&vtable[slot],sizeof(void*),PAGE_EXECUTE_READWRITE,&old)) return;
+    *original=vtable[slot];
+    vtable[slot]=hook;
+    VirtualProtect(&vtable[slot],sizeof(void*),old,&old);
+}
+
+struct CrosshairVertex { float x,y,z,rhw; DWORD color; };
+static void addBar(CrosshairVertex*& v, float x0, float y0, float x1, float y1, DWORD color) {
+    const CrosshairVertex c[6]={{x0,y0,0,1,color},{x1,y0,0,1,color},{x0,y1,0,1,color},
+                                {x1,y0,0,1,color},{x1,y1,0,1,color},{x0,y1,0,1,color}};
+    memcpy(v,c,sizeof(c)); v+=6;
+}
+
+static void drawCrosshair(IDirect3DDevice9* device) {
+    IDirect3DSurface9 *target=nullptr, *back=nullptr;
+    if(FAILED(device->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&back))) return;
+    D3DSURFACE_DESC desc{};
+    back->GetDesc(&desc);
+    IDirect3DStateBlock9* saved=nullptr;
+    if(!desc.Width || !desc.Height || FAILED(device->CreateStateBlock(D3DSBT_ALL,&saved))) { back->Release(); return; }
+    device->GetRenderTarget(0,&target);
+    device->SetRenderTarget(0,back);
+    device->BeginScene();
+    D3DVIEWPORT9 viewport={0,0,desc.Width,desc.Height,0,1};
+    device->SetViewport(&viewport);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(D3DFVF_XYZRHW|D3DFVF_DIFFUSE);
+    device->SetTexture(0,nullptr);
+    device->SetTextureStageState(0,D3DTSS_COLOROP,D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0,D3DTSS_COLORARG1,D3DTA_DIFFUSE);
+    device->SetTextureStageState(0,D3DTSS_ALPHAOP,D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0,D3DTSS_ALPHAARG1,D3DTA_DIFFUSE);
+    device->SetTextureStageState(1,D3DTSS_COLOROP,D3DTOP_DISABLE);
+    device->SetRenderState(D3DRS_ZENABLE,FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE,FALSE);
+    device->SetRenderState(D3DRS_STENCILENABLE,FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE,FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE,TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_CULLMODE,D3DCULL_NONE);
+    device->SetRenderState(D3DRS_LIGHTING,FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE,FALSE);
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE,FALSE);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE,FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE,0xf);
+    // Four short bars around a gap, white over a thin dark outline, scaled to
+    // the screen's height.
+    float cx=desc.Width*0.5f, cy=desc.Height*0.5f, h=float(desc.Height);
+    float gap=h*0.009f, len=h*0.016f, half=std::max(1.0f,h*0.0016f), edge=std::max(1.0f,h*0.0012f);
+    CrosshairVertex vertices[48], *v=vertices;
+    for(int pass=0;pass<2;pass++) {
+        float e=pass?0:edge, w=half+e;
+        DWORD color=pass?0xf0ffffff:0x90000000;
+        addBar(v,cx-w,cy-gap-len-e,cx+w,cy-gap+e,color);
+        addBar(v,cx-w,cy+gap-e,cx+w,cy+gap+len+e,color);
+        addBar(v,cx-gap-len-e,cy-w,cx-gap+e,cy+w,color);
+        addBar(v,cx+gap-e,cy-w,cx+gap+len+e,cy+w,color);
+    }
+    device->DrawPrimitiveUP(D3DPT_TRIANGLELIST,16,vertices,sizeof(CrosshairVertex));
+    device->EndScene();
+    saved->Apply();
+    saved->Release();
+    if(target) { device->SetRenderTarget(0,target); target->Release(); }
+    back->Release();
+}
+
+static HRESULT STDMETHODCALLTYPE hookPresent(IDirect3DDevice9* device, const RECT* source,
+        const RECT* dest, HWND window, const RGNDATA* dirty) {
+    if(crosshairShown) drawCrosshair(device);
+    return realPresent(device,source,dest,window,dirty);
+}
+static HRESULT STDMETHODCALLTYPE hookCreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type,
+        HWND window, DWORD flags, D3DPRESENT_PARAMETERS* params, IDirect3DDevice9** device) {
+    HRESULT result=realCreateDevice(d3d,adapter,type,window,flags,params,device);
+    if(SUCCEEDED(result) && device && *device)
+        hookVtable(*device,17,reinterpret_cast<void*>(hookPresent),reinterpret_cast<void**>(&realPresent));
+    return result;
+}
+static IDirect3D9* WINAPI hookCreate9(UINT version) {
+    IDirect3D9* d3d=realCreate9(version);
+    if(d3d) hookVtable(d3d,16,reinterpret_cast<void*>(hookCreateDevice),reinterpret_cast<void**>(&realCreateDevice));
+    return d3d;
+}
+// At load, before REbirth creates its device: its ddraw.dll import table is
+// already bound, so the d3d9!Direct3DCreate9 slot is swapped for the hook.
+static void hookDirect3D() {
+    auto base=reinterpret_cast<uint8_t*>(GetModuleHandleA("ddraw.dll"));
+    HMODULE d3d9=GetModuleHandleA("d3d9.dll");
+    if(!base || !d3d9) return;
+    auto real=reinterpret_cast<void*>(GetProcAddress(d3d9,"Direct3DCreate9"));
+    auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto nt=reinterpret_cast<IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
+    auto& dir=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if(!real || !dir.VirtualAddress) return;
+    for(auto imp=reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base+dir.VirtualAddress);imp->Name;imp++) {
+        if(lstrcmpiA(reinterpret_cast<char*>(base+imp->Name),"d3d9.dll")) continue;
+        for(auto slot=reinterpret_cast<void**>(base+imp->FirstThunk);*slot;slot++) {
+            if(*slot!=real) continue;
+            DWORD old;
+            if(!VirtualProtect(slot,sizeof(void*),PAGE_READWRITE,&old)) return;
+            realCreate9=reinterpret_cast<Create9Fn>(real);
+            *slot=reinterpret_cast<void*>(hookCreate9);
+            VirtualProtect(slot,sizeof(void*),old,&old);
+            return;
+        }
+    }
 }
 
 // XInputGetState clears the guide button; XInputGetStateEx (ordinal 100 of
@@ -621,6 +760,6 @@ extern "C" DWORD WINAPI DcGetState(DWORD user,XINPUT_STATE* state) {
     return result;
 }
 BOOL WINAPI DllMain(HINSTANCE module,DWORD reason,LPVOID) {
-    if(reason==DLL_PROCESS_ATTACH) { self=module; DisableThreadLibraryCalls(module); }
+    if(reason==DLL_PROCESS_ATTACH) { self=module; DisableThreadLibraryCalls(module); hookDirect3D(); }
     return TRUE;
 }
