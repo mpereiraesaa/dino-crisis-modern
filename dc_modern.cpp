@@ -435,10 +435,33 @@ static void restoreRoom(uintptr_t g) {
     meshesSorted=0;
 }
 
+// The game's auto-aim. With it on in the options, the weapon sets the
+// player's +0x1C0 bit 6 (SelectActorResourceArchiveAndAttachData), and then
+// the aim state (FUN_0048663E for the handgun) fires only when the hit test
+// listed an enemy, and turns her toward the nearest one (+0x241: 1 picks the
+// target, 2 turns, 3 done). Free aim decides where she faces and what a shot
+// hits, so a shot past an enemy was dropped and the turn never finished
+// (unless the fixed camera let it, which is why toggling cameras seemed to
+// help). While she aims with the shoulder camera the bit is cleared and the
+// turn cancelled; the bit comes back when she stops.
+static bool autoAimCleared;
+static void suspendAutoAim(uintptr_t g, bool suspend) {
+    auto flags=reinterpret_cast<volatile uint32_t*>(g+ACTOR+0x1c0);
+    auto turn=reinterpret_cast<volatile uint8_t*>(g+ACTOR+0x241);
+    if(suspend) {
+        if(*flags&0x40) { *flags&=~0x40u; autoAimCleared=true; }
+        if(*turn==1 || *turn==2) *turn=0;
+    } else if(autoAimCleared) {
+        *flags|=0x40;
+        autoAimCleared=false;
+    }
+}
+
 static void __cdecl cameraCallbackHook(uintptr_t context) {
     uint8_t index=*reinterpret_cast<volatile uint8_t*>(context+0x70);
     if(index<CAM_CALLBACK_COUNT && cameraCallbacks[index]) cameraCallbacks[index](context);
     uintptr_t g=context-0xb4;
+    suspendAutoAim(g,camHeld && camAiming);
     if(camHeld) {
         showWholeRoom(g);
         if(camAiming) *reinterpret_cast<volatile uint16_t*>(g+ACTOR+0x2a)=static_cast<uint16_t>(camYaw);
