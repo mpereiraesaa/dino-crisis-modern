@@ -1146,6 +1146,22 @@ static bool posesValid[3];
 // pose and the plain one every frame. So the gameplay scene call (0x433B4D)
 // takes the snapshot first.
 static ActorPose drawn[2][ACTORS];      // [0] this tick's scene, [1] the one before
+static uintptr_t sceneStart, sceneEnd;  // the packet pointer around the scene call
+
+// Screens drawn over the scene outside the scene passes (a document's
+// backdrop, the code panels, message windows) are not in the extra frame,
+// so they would flicker. Classic REbirth gives the game one packet area
+// (+0x1A6D00 from the base at 0x67B86C); in play only the closing packet
+// (0xC) and the cutscene bars (0x2C) are queued outside the scene call, so a
+// tick that queues more there shows for both vsyncs, as at 30 fps.
+constexpr uintptr_t PACKET_BASE=0x67b86c, PACKET_AREA=0x1a6d00;
+constexpr uintptr_t PLAIN_OUTSIDE=0xc+0x2c;
+static bool overlayQueued() {
+    auto block=*reinterpret_cast<uintptr_t**>(GAME_BLOCK);
+    uintptr_t area=*reinterpret_cast<volatile uintptr_t*>(PACKET_BASE)+PACKET_AREA;
+    if(sceneStart<area || sceneEnd<sceneStart || block[1]<sceneEnd || block[1]-area>0x40000) return false;
+    return (sceneStart-area)+(block[1]-sceneEnd)>PLAIN_OUTSIDE;
+}
 static bool drawnFresh, drawnOk[2];
 constexpr uintptr_t SCENE_CALL=0x433b4d;
 
@@ -1386,10 +1402,11 @@ static int __cdecl dispatchHook(int count) {
         memmove(poses[1],poses[0],sizeof(poses[0])*2);
         posesValid[2]=posesValid[1]; posesValid[1]=posesValid[0];
         readPoses(g,poses[0]); posesValid[0]=scene && !cut;
+        bool overlay=drawnFresh && overlayQueued();
         drawnOk[1]=drawnOk[0]; drawnOk[0]=drawnFresh && scene && !cut; drawnFresh=false;
         memcpy(pieces[1],pieces[0],sizeof(pieces[0]));
         readPieces(g,pieces[0]);
-        ok=scene && !cut;
+        ok=scene && !cut && !overlay;
     } else {
         camPrevValid=false; posesValid[0]=posesValid[1]=posesValid[2]=false;
         drawnOk[0]=drawnOk[1]=drawnFresh=false;
@@ -1408,7 +1425,10 @@ static void __cdecl sceneHook() {
         readPoses(g,drawn[0]);
         drawnFresh=true;
     }
+    auto block=*reinterpret_cast<uintptr_t**>(GAME_BLOCK);
+    sceneStart=block[1];
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    sceneEnd=block[1];
 }
 
 static void hookDispatch() {
