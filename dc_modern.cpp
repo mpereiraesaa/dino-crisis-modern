@@ -345,6 +345,10 @@ static void placeShoulderCamera(uintptr_t g) {
 // +0x2F, which a story event sets to hide a mesh. The game's own bits are
 // never touched, so a camera cut while the shoulder camera is on cannot leave
 // them wrong.
+// Characters have the same problem: before each scene, 0x40FBB7 shows an
+// actor only while it stands inside the current fixed camera's trigger
+// quads, so down a corridor a dinosaur stayed invisible until Regina was
+// almost in its mouth. Its quad loop is patched to report a hit at once.
 constexpr uintptr_t ROOM_MESHES=0x7ce8, ROOM_MESH_SIZE=0x88;
 constexpr int ROOM_MESH_COUNT=36;
 struct CodePatch { uintptr_t at; uint8_t size; uint8_t original[17], patched[17]; };
@@ -359,6 +363,9 @@ static const CodePatch roomPatches[]={
      {0x8b,0x4d,0xf0,0x80,0x79,0x2f,0x00,0x0f,0x85,0x42,0x05,0x00,0x00,0x90,0x90,0x90,0x90}},
     // The second room pass: and eax,2 -> and eax,1.
     {0x44d615,3,{0x83,0xe0,0x02},{0x83,0xe0,0x01}},
+    // The actor visibility test: jae 0x40FCDD (no quad hit) -> jmp 0x40FCCF
+    // (visible).
+    {0x40fc63,2,{0x73,0x78},{0xeb,0x6a}},
 };
 static bool wholeRoom;
 static uint64_t meshesSorted;
