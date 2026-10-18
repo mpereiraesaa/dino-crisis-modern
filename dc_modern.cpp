@@ -442,6 +442,32 @@ static void restoreRoom(uintptr_t g) {
     meshesSorted=0;
 }
 
+// Laser barriers. A room controller of type 4 (ten 0x24-byte records at
+// gameState+0x9008; 0x4B0E10) drives mesh [4] and the next one: while the
+// laser is on it flips bit 1 between the two each frame, and once switched
+// off it clears bit 1 on both. The shoulder camera's patches ignore bit 1,
+// so a laser switched off stayed on screen. Around each scene the meshes of
+// a laser that bit 1 hides also lose bit 0 (active), and get it back after.
+constexpr uintptr_t CONTROLLERS=0x9008, CONTROLLER_SIZE=0x24;
+constexpr int CONTROLLER_COUNT=10, LASER_CONTROLLER=4;
+static uint64_t hideLasers(uintptr_t g) {
+    uint64_t hidden=0;
+    if(!wholeRoom || !g) return 0;
+    for(int i=0;i<CONTROLLER_COUNT;i++) {
+        auto c=reinterpret_cast<volatile uint8_t*>(g+CONTROLLERS+i*CONTROLLER_SIZE);
+        if(!(c[0]&1) || c[1]!=LASER_CONTROLLER) continue;
+        for(int m=c[4];m<=c[4]+1 && m<ROOM_MESH_COUNT;m++) {
+            auto flags=reinterpret_cast<volatile uint32_t*>(g+ROOM_MESHES+m*ROOM_MESH_SIZE+0x30);
+            if((*flags&3)==1) { *flags&=~1u; hidden|=1ull<<m; }
+        }
+    }
+    return hidden;
+}
+static void showLasers(uintptr_t g, uint64_t hidden) {
+    for(int m=0;m<ROOM_MESH_COUNT;m++)
+        if(hidden&(1ull<<m)) *reinterpret_cast<volatile uint32_t*>(g+ROOM_MESHES+m*ROOM_MESH_SIZE+0x30)|=1;
+}
+
 // The game's auto-aim. With it on in the options, the weapon sets the
 // player's +0x1C0 bit 6 (SelectActorResourceArchiveAndAttachData), and then
 // the aim state (FUN_0048663E for the handgun) fires only when the hit test
@@ -1373,7 +1399,9 @@ static void renderExtraFrame(uintptr_t g, float t) {
     static PiecePose savedPieces[2][60];
     blendPoses(g,t,savedPoses);
     if(posesValid[1]) blendPieces(g,t,savedPieces); else readPieces(g,savedPieces);
+    uint64_t lasers=hideLasers(g);
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    showLasers(g,lasers);
     queueCutsceneBars(g,idle);
     restorePieces(g,savedPieces);
     restorePoses(g,savedPoses);
@@ -1428,14 +1456,17 @@ static int __cdecl dispatchHook(int count) {
 }
 
 static void __cdecl sceneHook() {
-    if(uintptr_t g=gameState()) {
+    uintptr_t g=gameState();
+    if(g) {
         memcpy(drawn[1],drawn[0],sizeof(drawn[0]));
         readPoses(g,drawn[0]);
         drawnFresh=true;
     }
     auto block=*reinterpret_cast<uintptr_t**>(GAME_BLOCK);
     sceneStart=block[1];
+    uint64_t lasers=hideLasers(g);
     reinterpret_cast<VoidFn>(RENDER_SCENE)();
+    showLasers(g,lasers);
     sceneEnd=block[1];
 }
 
