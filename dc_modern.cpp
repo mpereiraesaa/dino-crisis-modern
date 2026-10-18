@@ -184,9 +184,10 @@ static void skipDoor(uintptr_t g) {
 // and the target (+0xE4) ahead, with the distance and the angles from the
 // game's own helpers. The right stick turns it; aiming swings it behind her.
 // Movement stays relative to the camera, so it plays like RE4 Remake. The
-// touchpad (XInput 0x0400 from prospero-win), F12 or, on PC, R3 toggles it.
+// touchpad (on the PS5), R3 (on PC) or F12 toggles it.
 constexpr uintptr_t CAM_EYE=0xd4, CAM_TARGET=0xe4, CAM_DISTANCE=0xf0, CAM_ANGLES=0xdc;
 constexpr uintptr_t CAM_CALLBACKS=0x645c1c;
+constexpr WORD XINPUT_GAMEPAD_GUIDE=0x0400;
 constexpr int CAM_CALLBACK_COUNT=10;
 typedef void (__cdecl *CameraCallback)(uintptr_t context);
 typedef void (__cdecl *ViewAnglesFn)(volatile int16_t* target, volatile int16_t* eye, volatile int16_t* angles);
@@ -438,11 +439,13 @@ static bool toggleKeyPressed() {
 
 static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
     hookCameraCallbacks();
-    static int r3Toggles=-1;
-    if(r3Toggles<0) r3Toggles=!titleMenuPresent();
+    // prospero-win reports the DualSense touchpad as the guide button. On PC
+    // the guide button belongs to Steam and the Game Bar, so R3 toggles there.
+    static int onPs5=-1;
+    if(onPs5<0) onPs5=titleMenuPresent();
     WORD pressed=pad.wButtons&~camPrevButtons;
     camPrevButtons=pad.wButtons;
-    WORD toggles=r3Toggles?0x0400|XINPUT_GAMEPAD_RIGHT_THUMB:0x0400;
+    WORD toggles=onPs5?XINPUT_GAMEPAD_GUIDE:XINPUT_GAMEPAD_RIGHT_THUMB;
     if((pressed&toggles) || toggleKeyPressed()) {
         camOn=!camOn;
         WritePrivateProfileStringA("Camera","Mode",camOn?"Modern":"Fixed",ini);
@@ -528,25 +531,32 @@ static int64_t steer(Pad& p, uintptr_t g, XINPUT_GAMEPAD& pad) {
     return pad.sThumbLY;
 }
 
+// XInputGetState clears the guide button; XInputGetStateEx (ordinal 100 of
+// xinput1_4 and xinput1_3) keeps it, and the filter clears it itself before
+// REbirth sees the state.
 typedef DWORD (WINAPI *GetStateFn)(DWORD,XINPUT_STATE*);
-static BOOL CALLBACK loadXInput(INIT_ONCE*, void*, void** found) {
+static GetStateFn getState;
+static BOOL CALLBACK loadXInput(INIT_ONCE*, void*, void**) {
     char path[MAX_PATH];
     UINT n=GetSystemDirectoryA(path,MAX_PATH);
-    for(const char* name : {"xinput9_1_0.dll","xinput1_4.dll","xinput1_3.dll"}) {
-        if(!n || n+strlen(name)+2>MAX_PATH) break;
+    auto find=[&](const char* name, LPCSTR export_) -> GetStateFn {
+        if(!n || n+strlen(name)+2>MAX_PATH) return nullptr;
         snprintf(path+n,MAX_PATH-n,"\\%s",name);
-        if(HMODULE module=LoadLibraryA(path))
-            if(FARPROC get=GetProcAddress(module,"XInputGetState")) { *found=reinterpret_cast<void*>(get); break; }
-    }
+        HMODULE module=LoadLibraryA(path);
+        return module?reinterpret_cast<GetStateFn>(reinterpret_cast<void*>(GetProcAddress(module,export_))):nullptr;
+    };
+    for(const char* name : {"xinput1_4.dll","xinput1_3.dll"})
+        if(!getState) getState=find(name,MAKEINTRESOURCEA(100));
+    for(const char* name : {"xinput9_1_0.dll","xinput1_4.dll","xinput1_3.dll"})
+        if(!getState) getState=find(name,"XInputGetState");
     return TRUE;
 }
 
 extern "C" DWORD WINAPI DcGetState(DWORD user,XINPUT_STATE* state) {
     static INIT_ONCE once=INIT_ONCE_STATIC_INIT;
-    void* get=nullptr;
-    InitOnceExecuteOnce(&once,loadXInput,nullptr,&get);
-    if(!get) return ERROR_DEVICE_NOT_CONNECTED;
-    DWORD result=reinterpret_cast<GetStateFn>(get)(user,state);
+    InitOnceExecuteOnce(&once,loadXInput,nullptr,nullptr);
+    if(!getState) return ERROR_DEVICE_NOT_CONNECTED;
+    DWORD result=getState(user,state);
     if(user>=4) return result;
     AcquireSRWLockExclusive(&lock);
     config();
@@ -554,9 +564,10 @@ extern "C" DWORD WINAPI DcGetState(DWORD user,XINPUT_STATE* state) {
     if(result!=ERROR_SUCCESS || !state) {
         p.running=false; p.latched=false; ReleaseSRWLockExclusive(&lock); return result;
     }
+    uintptr_t gs=enabled?gameState():0;
+    if(enabled) shoulderCamera(gs,state->Gamepad);
+    state->Gamepad.wButtons&=~XINPUT_GAMEPAD_GUIDE;
     if(enabled) {
-        uintptr_t gs=gameState();
-        shoulderCamera(gs,state->Gamepad);
         remapFaceButtons(state->Gamepad); remapTriggers(state->Gamepad); skipDoor(gs);
     }
     uintptr_t g=enabled?gameplay():0;
