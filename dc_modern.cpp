@@ -28,7 +28,7 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static char ini[MAX_PATH];
 static bool configured, supported;
 static DWORD configTime;
-static int interpolate=0;
+static int interpolate=1;
 static int enabled=1, onPercent=75, offPercent=65;
 static int modern=1, turnRate=4096*2, deadzone=8000, holdCamera=1;
 static int triggers=1, triggerThreshold=77, faceButtons=1, doorSkip=1;
@@ -99,7 +99,7 @@ static void config() {
     camRadius=std::max(40,std::min(600,(int)GetPrivateProfileIntA("Camera","CollisionRadius",200,ini)));
     camRiseWhenClose=GetPrivateProfileIntA("Camera","RiseWhenClose",500,ini);
     camMinDistance=GetPrivateProfileIntA("Camera","MinDistance",550,ini);
-    interpolate=GetPrivateProfileIntA("Debug","Interpolate",0,ini);
+    interpolate=GetPrivateProfileIntA("Display","FrameRate",60,ini)>=60;
     configTime=now;
 }
 
@@ -796,7 +796,7 @@ static void hookDirect3D() {
     }
 }
 
-// 60 fps (work in progress). The game ticks at 30: Classic REbirth's frame
+// 60 fps ([Display] FrameRate=60). The game ticks at 30: Classic REbirth's frame
 // loop (ddraw.dll 0x1004DD10) calls DispatchFrameOutputCallback (0x5F30E0)
 // with 2, so every image is presented for two 60 Hz vsyncs. The second one
 // shows an extra frame instead: the scene is built again, with the camera
