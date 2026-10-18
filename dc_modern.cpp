@@ -291,6 +291,8 @@ static double camPull=1;                   // 0..1 of the wanted distance
 
 constexpr int AIM_HEIGHT=1250;           // the gun's height while aiming
 static volatile bool crosshairShown;
+static volatile double aimPitch;         // radians, positive up
+static volatile bool freeAim;            // aiming with the shoulder camera: our hit test
 
 static void placeShoulderCamera(uintptr_t g) {
     auto pos=reinterpret_cast<volatile int16_t*>(g+ACTOR+0x20);
@@ -324,7 +326,7 @@ static void placeShoulderCamera(uintptr_t g) {
     // crosshair in the middle of the screen marks where she shoots.
     double side=aiming?0:shoulder*0.5;
     target[0]=clamp16(pos[0]+fx*camLook+rx*side);
-    target[1]=clamp16(pos[1]-(aiming?AIM_HEIGHT:camLookHeight));
+    target[1]=clamp16(pos[1]-(aiming?AIM_HEIGHT+std::tan(aimPitch)*camLook:camLookHeight));
     target[2]=clamp16(pos[2]+fz*camLook+rz*side);
     *reinterpret_cast<volatile int16_t*>(g+CAM_DISTANCE)=pointDistance(target,eye);
     computeViewAngles(target,eye,reinterpret_cast<volatile int16_t*>(g+CAM_ANGLES));
@@ -436,12 +438,96 @@ static void __cdecl cameraCallbackHook(uintptr_t context) {
     uintptr_t g=context-0xb4;
     if(camHeld) {
         showWholeRoom(g);
+        if(camAiming) *reinterpret_cast<volatile uint16_t*>(g+ACTOR+0x2a)=static_cast<uint16_t>(camYaw);
         placeShoulderCamera(g);
     } else restoreRoom(g);
 }
+// Free aim's hit test. Every weapon asks FUN_004620C1(player, zone) which
+// enemies a shot reaches: the 10 actors at gameState+0x288 (0x260 bytes each)
+// that are active (+0x30 bit 0), hittable (+0x11E bit 6 clear, +0x175 bit 7
+// clear), in sight (FUN_00469E84 against the room's collision) and inside the
+// weapon's zone, a trapezoid on the floor 200..20200 ahead and up to 8000
+// wide: a wide cone, the game's auto-aim, blind to height. It stores up to 3,
+// nearest first, in the player's +0x24C list, which the weapon then hits.
+// While she aims with the shoulder camera the hook answers instead: a ray
+// from the camera through the crosshair must cross a cylinder around the
+// actor (its height included) in front of Regina, within the same 20200.
+// Hits, damage and reactions stay the game's.
+constexpr uintptr_t HIT_TEST=0x4620c1, LINE_OF_SIGHT=0x469e84;
+constexpr double HIT_RANGE=20200, HIT_RADIUS=500, HIT_HEIGHT=1600;
+typedef void (__cdecl *HitTestFn)(uintptr_t player, uintptr_t zone);
+typedef char (__cdecl *LineOfSightFn)(volatile int16_t* from, volatile int16_t* to, uint32_t mode);
+static HitTestFn originalHitTest;
+
+static void __cdecl freeAimHitTest(uintptr_t player, uintptr_t zone) {
+    uintptr_t g=gameState();
+    if(!freeAim || !g || player!=g+ACTOR) { originalHitTest(player,zone); return; }
+    auto eye=reinterpret_cast<volatile int16_t*>(g+CAM_EYE);
+    auto at=reinterpret_cast<volatile int16_t*>(g+CAM_TARGET);
+    auto me=reinterpret_cast<volatile int16_t*>(player+0x20);
+    double ox=eye[0], oy=eye[1], oz=eye[2];
+    double dx=at[0]-ox, dy=at[1]-oy, dz=at[2]-oz;
+    double len=std::sqrt(dx*dx+dy*dy+dz*dz);
+    if(len<1) { originalHitTest(player,zone); return; }
+    dx/=len; dy/=len; dz/=len;
+    double flat=dx*dx+dz*dz;                // the ray's horizontal part, squared
+    // Regina's own distance along the ray: hits must lie beyond her.
+    double self=(me[0]-ox)*dx+(me[1]-oy)*dy+(me[2]-oz)*dz;
+    struct Hit { double t; uint8_t index; } hits[10];
+    int count=0;
+    auto lineOfSight=reinterpret_cast<LineOfSightFn>(LINE_OF_SIGHT);
+    for(int i=0;i<10;i++) {
+        uintptr_t a=g+0x288+i*0x260;
+        auto flags=*reinterpret_cast<volatile uint32_t*>(a+0x30);
+        if(!(flags&1) || (*reinterpret_cast<volatile uint8_t*>(a+0x11e)&0x40) ||
+           (*reinterpret_cast<volatile uint8_t*>(a+0x175)&0x80)) continue;
+        auto pos=reinterpret_cast<volatile int16_t*>(a+0x20);
+        double ax=pos[0]-ox, az=pos[2]-oz;
+        if(std::hypot(pos[0]-me[0],pos[2]-me[2])>HIT_RANGE || flat<1e-9) continue;
+        // Where the ray's horizontal part enters and leaves the cylinder.
+        double b=ax*dx+az*dz, c=ax*ax+az*az-HIT_RADIUS*HIT_RADIUS, disc=b*b-flat*c;
+        if(disc<0) continue;
+        double t0=(b-std::sqrt(disc))/flat, t1=(b+std::sqrt(disc))/flat;
+        if(t1<=self) continue;
+        t0=std::max(t0,self);
+        // y grows downward: the cylinder runs from the feet up HIT_HEIGHT.
+        double y0=oy+dy*t0, y1=oy+dy*t1, feet=pos[1], top=pos[1]-HIT_HEIGHT;
+        if(std::max(y0,y1)<top || std::min(y0,y1)>feet) continue;
+        if(lineOfSight(me,pos,5)) continue;    // a wall in between
+        hits[count++]={t0,static_cast<uint8_t>(i)};
+    }
+    for(int i=1;i<count;i++)                // nearest first; at most 10
+        for(int j=i;j>0 && hits[j].t<hits[j-1].t;j--) std::swap(hits[j],hits[j-1]);
+    int n=std::min(count,3);
+    auto list=reinterpret_cast<volatile uint8_t*>(player+0x24c);
+    for(int i=0;i<n;i++) list[n-i]=hits[i].index;   // nearest last: popped first
+    list[0]=static_cast<uint8_t>(n);
+}
+
+// A jmp at the hit test's entry; the original stays callable through a copy
+// of its first 6 bytes (push ebp; mov ebp,esp; sub esp,0x5C) and a jump back.
+static void hookHitTest() {
+    static const uint8_t prologue[6]={0x55,0x8b,0xec,0x83,0xec,0x5c};
+    auto entry=reinterpret_cast<uint8_t*>(HIT_TEST);
+    if(originalHitTest || memcmp(entry,prologue,6)) return;
+    auto thunk=static_cast<uint8_t*>(VirtualAlloc(nullptr,16,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE));
+    if(!thunk) return;
+    memcpy(thunk,prologue,6);
+    thunk[6]=0xe9;
+    int32_t back=int32_t(HIT_TEST+6-(reinterpret_cast<uintptr_t>(thunk)+11));
+    memcpy(thunk+7,&back,4);
+    FlushInstructionCache(GetCurrentProcess(),thunk,16);
+    originalHitTest=reinterpret_cast<HitTestFn>(thunk);
+    uint8_t jump[6]={0xe9,0,0,0,0,0x90};
+    int32_t rel=int32_t(reinterpret_cast<uintptr_t>(freeAimHitTest)-(HIT_TEST+5));
+    memcpy(jump+1,&rel,4);
+    applyPatch(entry,jump,6);
+}
+
 static void hookCameraCallbacks() {
     if(callbacksHooked || !supported) return;
     callbacksHooked=true;
+    hookHitTest();
     auto table=reinterpret_cast<CameraCallback*>(CAM_CALLBACKS);
     for(int i=0;i<CAM_CALLBACK_COUNT;i++) {
         auto entry=reinterpret_cast<uintptr_t>(table[i]);
@@ -507,24 +593,27 @@ static void shoulderCamera(uintptr_t g, XINPUT_GAMEPAD& pad) {
         play=outer==3 && mode==1 && !(pauseFlags&0x20000000) && !(flags&4);
         aiming=play && action==6;
     }
-    if(!camOn || !play || !callbacksHooked) { camHeld=false; crosshairShown=false; return; }
+    if(!camOn || !play || !callbacksHooked) { camHeld=false; crosshairShown=false; freeAim=false; return; }
 
     int yaw=camYaw;
     auto yawNow=*reinterpret_cast<volatile uint16_t*>(g+ACTOR+0x2a)&0xfff;
     if(!camHeld) yaw=yawNow;               // start behind her
     if(aiming) {
-        // The game turns her while she aims (the left stick, tank style); the
-        // right stick turns her too, as in modern shooters.
-        if(std::abs(pad.sThumbRX)>deadzone && std::abs(pad.sThumbLX)<=deadzone) pad.sThumbLX=pad.sThumbRX;
-        int d=delta4096(yawNow,yaw);
-        int step=int(dt*4096*2);
-        yaw=std::abs(d)<=step?yawNow:yaw+(d>0?step:-step);
+        // Free aim, as in RE4: the right stick moves the aim, left and right
+        // and up and down, and she turns to face it (cameraCallbackHook). The
+        // left stick still walks her forward and back; it no longer turns her.
+        if(!camAiming) aimPitch=0;
+        if(std::abs(pad.sThumbRX)>deadzone) yaw+=int(dt*camTurnRate*0.6*pad.sThumbRX/32767.0);
+        if(std::abs(pad.sThumbRY)>deadzone)
+            aimPitch=std::max(-0.6,std::min(0.6,aimPitch+dt*1.2*pad.sThumbRY/32767.0));
+        pad.sThumbLX=0;
     } else if(std::abs(pad.sThumbRX)>deadzone) {
         yaw+=int(dt*camTurnRate*pad.sThumbRX/32767.0);
     }
     camYaw=yaw&0xfff;
     camAiming=aiming;
     crosshairShown=aiming;
+    freeAim=aiming;
     pad.sThumbRX=pad.sThumbRY=0;
     if(!camHeld) placeShoulderCamera(g);   // the steering below reads it now
     camHeld=true;
